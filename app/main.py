@@ -28,6 +28,7 @@ from app.dependencies import get_db
 from app.routers.mercadolibre import router as meli_router
 from app.routers.listings import router as listings_router
 from app.routers.orders import router as orders_router
+from app.routers.images import router as images_router, media_router
 from app.scheduler import scheduler, setup_scheduler
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,8 @@ app.add_middleware(
 app.include_router(meli_router)
 app.include_router(listings_router)
 app.include_router(orders_router)
+app.include_router(images_router)
+app.include_router(media_router)
 
 
 @app.get("/", tags=["Health"])

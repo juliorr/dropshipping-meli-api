@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import async_session
-from app.backend_database import backend_async_session
 from app.utils.security import decode_token
 
 security = HTTPBearer()
@@ -56,15 +55,6 @@ async def get_current_user(
         id=int(user_id),
         is_superuser=payload.get("is_superuser", False),
     )
-
-
-async def get_backend_db() -> AsyncGenerator[AsyncSession, None]:
-    """Dependency to get a session to the backend database (products, users)."""
-    async with backend_async_session() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
 
 
 async def verify_api_key(x_api_key: str = Header(...)) -> None:

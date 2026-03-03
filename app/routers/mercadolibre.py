@@ -7,14 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-
 from app.config import settings
-from app.dependencies import get_backend_db, get_current_user, get_db
+from app.dependencies import get_current_user, get_db
 from app.models.listing import MeliListing
 from app.models.meli_token import MeliToken
-from app.models.product import Product
-from app.models.user import User
+from app.services.image_storage import get_image_paths
 from app.schemas.meli import (
     MeliAuthUrlResponse,
     MeliCategoryAttributesResponse,
@@ -399,7 +396,6 @@ async def publish_listing_to_meli(
     data: MeliPublishRequest,
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    backend_db: AsyncSession = Depends(get_backend_db),
 ):
     """
     Publish a listing to Mercado Libre.
@@ -434,15 +430,6 @@ async def publish_listing_to_meli(
             f"family_name. Rejecting before image upload. Listing {listing.id} will be cleaned up."
         )
         # Limpiar el listing draft para que el usuario pueda reintentar
-        product_for_cleanup = (await backend_db.execute(
-        select(Product).where(Product.id == listing.product_id)
-        )).scalar_one_or_none()
-        if product_for_cleanup:
-            product_for_cleanup.status = "scraped"
-            try:
-                await backend_db.commit()
-            except Exception:
-                await backend_db.rollback()
         try:
             await db.rollback()
             await db.delete(listing)
@@ -500,18 +487,9 @@ async def publish_listing_to_meli(
             "children": [{"id": c.id, "name": c.name} for c in children],
         })
 
-    # Get product images
-    product = (await backend_db.execute(
-        select(Product).where(Product.id == listing.product_id)
-    )).scalar_one_or_none()
-
-    pictures = []
-    if product:
-        product_with_images = (await backend_db.execute(
-        select(Product).where(Product.id == listing.product_id).options(selectinload(Product.images))
-        )).scalar_one_or_none()
-        if product_with_images and product_with_images.images:
-            pictures = [img.url for img in product_with_images.images]
+    # Get product images from local filesystem
+    product_id = data.product_id or listing.product_id
+    pictures = get_image_paths(product_id) if product_id else []
 
     # ML requires at least 1 image to publish
     if not pictures:
@@ -524,8 +502,8 @@ async def publish_listing_to_meli(
         )
 
     # Build dynamic attributes for ML
-    brand = data.brand or (product.brand if product and product.brand else None)
-    model = data.model or (product.title[:60] if product else listing.title[:60])
+    brand = data.brand or data.product_brand or None
+    model = data.model or (data.product_title[:60] if data.product_title else listing.title[:60])
 
     # Convert dynamic attributes from request to the format publish_item expects
     extra_attributes = []
@@ -548,13 +526,13 @@ async def publish_listing_to_meli(
     # no fue enviado en absoluto (compatibilidad hacia atrás con publicaciones antiguas).
     has_gtin = any(a.get("id") == "GTIN" for a in extra_attributes)
     has_empty_gtin_reason = any(a.get("id") == "EMPTY_GTIN_REASON" for a in extra_attributes)
-    if not has_gtin and not has_empty_gtin_reason and product:
+    if not has_gtin and not has_empty_gtin_reason and data.product_asin:
         logger.info(
-            f"[GTIN] Auto-injecting GTIN with ASIN '{product.asin}' "
+            f"[GTIN] Auto-injecting GTIN with ASIN '{data.product_asin}' "
             f"for listing {listing.id} (category {listing.meli_category_id}) — "
             "frontend did not send GTIN explicitly"
         )
-        extra_attributes.append({"id": "GTIN", "value_name": product.asin})
+        extra_attributes.append({"id": "GTIN", "value_name": data.product_asin})
     elif has_gtin:
         # El frontend envió GTIN — verificar si tiene valor real o está vacío
         gtin_attr = next((a for a in extra_attributes if a.get("id") == "GTIN"), None)
@@ -667,12 +645,10 @@ async def publish_listing_to_meli(
                         "Cleaning up draft listing."
                     )
                     # Limpiar el listing draft para que el usuario pueda reintentar
-                    if product:
-                        product.status = "scraped"
+                    # Product status cleanup handled by frontend
                     try:
                         await db.delete(listing)
                         await db.commit()
-                        await backend_db.commit()
                     except Exception as cleanup_err:
                         logger.error(f"Failed to clean up draft listing {listing.id} (family_name): {cleanup_err}")
 
@@ -750,12 +726,10 @@ async def publish_listing_to_meli(
                         "Cleaning up and returning alternative categories."
                     )
                     # Revert product status and clean up the draft listing
-                    if product:
-                        product.status = "scraped"
+                    # Product status cleanup handled by frontend
                     try:
                         await db.delete(listing)
                         await db.commit()
-                        await backend_db.commit()
                     except Exception:
                         pass
 
@@ -834,12 +808,9 @@ async def publish_listing_to_meli(
                             f"[MISSING ATTRS] Cleaning up draft listing {listing.id} "
                             f"due to missing required attributes: {missing_attr_messages}"
                         )
-                        if product:
-                            product.status = "scraped"
                         try:
                             await db.delete(listing)
                             await db.commit()
-                            await backend_db.commit()
                         except Exception as cleanup_err:
                             logger.error(f"Failed to clean up draft listing {listing.id} (missing attrs): {cleanup_err}")
 
@@ -904,12 +875,9 @@ async def publish_listing_to_meli(
 
         # Generic ML error — clean up the orphan draft listing before raising
         logger.warning(f"Generic ML error for listing {listing.id}, cleaning up draft...")
-        if product:
-            product.status = "scraped"
         try:
             await db.delete(listing)
             await db.commit()
-            await backend_db.commit()
         except Exception as cleanup_err:
             logger.error(f"Failed to clean up draft listing {listing.id}: {cleanup_err}")
 
@@ -920,12 +888,7 @@ async def publish_listing_to_meli(
     listing.meli_permalink = result.get("permalink")
     listing.status = "active"
 
-    # Update product status
-    if product:
-        product.status = "published"
-
     await db.commit()
-    await backend_db.commit()
 
     # Collect any warnings from the response (convert dict objects to strings)
     warnings = None
@@ -941,6 +904,7 @@ async def publish_listing_to_meli(
         meli_item_id=listing.meli_item_id,
         permalink=listing.meli_permalink or "",
         status="active",
+        product_status="published",
         warnings=warnings,
         variations_count=variations_count if data.variations else None,
         variations_dropped=variations_dropped if data.variations else None,
@@ -952,7 +916,6 @@ async def update_listing_on_meli(
     listing_id: int,
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    backend_db: AsyncSession = Depends(get_backend_db),
 ):
     """
     Update an existing listing on Mercado Libre.
@@ -969,16 +932,8 @@ async def update_listing_on_meli(
     if not listing.meli_item_id:
         raise HTTPException(status_code=400, detail="Listing has not been published to ML yet")
 
-    # Get product images
-    product = None
-    pictures = []
-    product_with_images = (await backend_db.execute(
-        select(Product).where(Product.id == listing.product_id).options(selectinload(Product.images))
-    )).scalar_one_or_none()
-    if product_with_images:
-        product = product_with_images
-        if product_with_images.images:
-            pictures = [img.url for img in product_with_images.images]
+    # Get product images from local filesystem
+    pictures = get_image_paths(listing.product_id) if listing.product_id else []
 
     # Build update payload (ML only allows certain fields to be updated)
     updates = {
@@ -1062,11 +1017,11 @@ async def close_listing_on_meli(
     listing_id: int,
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    backend_db: AsyncSession = Depends(get_backend_db),
 ):
     """
     Close/delete a listing on Mercado Libre permanently.
     Closes the item on ML API, then removes the local listing record.
+    Product status update is handled by the frontend.
     """
     # Get the listing
     query = select(MeliListing).where(
@@ -1080,7 +1035,7 @@ async def close_listing_on_meli(
         # No ML item — just delete the local listing
         await db.delete(listing)
         await db.commit()
-        return {"message": "Listing draft deleted"}
+        return {"message": "Listing draft deleted", "product_status": "scraped"}
 
     # Close the item on ML
     result = await close_item(
@@ -1093,21 +1048,14 @@ async def close_listing_on_meli(
         detail = result.get("detail", "Unknown error") if result else "No response from ML"
         raise HTTPException(status_code=500, detail=f"ML close failed: {detail}")
 
-    # Update product status back to scraped
-    product = (await backend_db.execute(
-        select(Product).where(Product.id == listing.product_id)
-    )).scalar_one_or_none()
-    if product:
-        product.status = "scraped"
-
     # Remove the local listing
     await db.delete(listing)
     await db.commit()
-    await backend_db.commit()
 
     return {
         "message": "Publicación cerrada y eliminada de Mercado Libre",
         "meli_item_id": listing.meli_item_id,
+        "product_status": "scraped",
     }
 
 
@@ -1146,13 +1094,13 @@ async def publish_catalog_listing_to_meli(
     catalog_product_id: str = Query(..., description="ML catalog product ID (e.g. MLM123456)"),
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    backend_db: AsyncSession = Depends(get_backend_db),
 ):
     """
     Publish a listing to Mercado Libre using catalog mode.
     Used when the category requires catalog_listing=force (family_name obligatorio).
     The listing must exist and belong to the current user.
     The catalog_product_id must be a valid ML catalog product.
+    Product status update is handled by the frontend.
     """
     # Get the listing
     query = select(MeliListing).where(
@@ -1164,10 +1112,6 @@ async def publish_catalog_listing_to_meli(
 
     if listing.meli_item_id:
         raise HTTPException(status_code=400, detail="Listing already published on ML")
-
-    product = (await backend_db.execute(
-        select(Product).where(Product.id == listing.product_id)
-    )).scalar_one_or_none()
 
     result = await publish_item_catalog(
         db=db,
@@ -1192,16 +1136,13 @@ async def publish_catalog_listing_to_meli(
     listing.meli_permalink = result.get("permalink")
     listing.status = "active"
 
-    if product:
-        product.status = "published"
-
     await db.commit()
-    await backend_db.commit()
 
     return MeliPublishResponse(
         meli_item_id=listing.meli_item_id,
         permalink=listing.meli_permalink or "",
         status="active",
+        product_status="published",
         warnings=None,
     )
 
@@ -1296,7 +1237,6 @@ async def publish_variants_to_meli(
     data: MeliPublishVariantsRequest,
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    backend_db: AsyncSession = Depends(get_backend_db),
 ):
     """
     Publish each variation as a separate ML item (1-to-N).
@@ -1316,19 +1256,12 @@ async def publish_variants_to_meli(
     if base_listing is None:
         raise HTTPException(status_code=404, detail="Base listing not found")
 
-    # Get product for brand and images fallback
-    product = None
-    product_with_images = None
-    if base_listing.product_id:
-        product = (await backend_db.execute(
-            select(Product).where(Product.id == base_listing.product_id)
-        )).scalar_one_or_none()
-        product_with_images = (await backend_db.execute(
-            select(Product).where(Product.id == base_listing.product_id).options(selectinload(Product.images))
-        )).scalar_one_or_none()
+    # Get product images from local filesystem for fallback
+    product_id = data.product_id or base_listing.product_id
+    fallback_pictures = get_image_paths(product_id) if product_id else []
 
     base_title = base_listing.title
-    brand = data.brand or (product.brand if product and product.brand else None)
+    brand = data.brand or data.product_brand or None
 
     # Build sale_terms
     sale_terms = None
@@ -1360,8 +1293,8 @@ async def publish_variants_to_meli(
     # GTIN fallback
     has_gtin = any(a.get("id") == "GTIN" for a in extra_attributes)
     has_empty_gtin_reason = any(a.get("id") == "EMPTY_GTIN_REASON" for a in extra_attributes)
-    if not has_gtin and not has_empty_gtin_reason and product:
-        extra_attributes.append({"id": "GTIN", "value_name": product.asin})
+    if not has_gtin and not has_empty_gtin_reason and data.product_asin:
+        extra_attributes.append({"id": "GTIN", "value_name": data.product_asin})
     elif has_gtin:
         gtin_attr = next((a for a in extra_attributes if a.get("id") == "GTIN"), None)
         if not (gtin_attr or {}).get("value_name", "").strip():
@@ -1426,10 +1359,10 @@ async def publish_variants_to_meli(
                     )
                     db.add(variant_listing)
 
-            # 2. Gather images: variant-specific first, fallback to product images
+            # 2. Gather images: variant-specific first, fallback to product images on filesystem
             pictures = variation.images[:10] if variation.images else []
-            if not pictures and product_with_images and product_with_images.images:
-                pictures = [img.url for img in product_with_images.images]
+            if not pictures:
+                pictures = fallback_pictures
 
             if not pictures:
                 user_error = "Sin imágenes disponibles para esta variante"
@@ -1527,14 +1460,7 @@ async def publish_variants_to_meli(
                 error=user_error or _friendly_error(exc),
             ))
 
-    # Update product status if at least one succeeded
     succeeded = sum(1 for r in results if r.success)
-    if succeeded > 0 and product:
-        try:
-            product.status = "published"
-            await backend_db.commit()
-        except Exception:
-            pass
 
     return MeliPublishBulkResponse(
         results=results,
@@ -1542,4 +1468,3 @@ async def publish_variants_to_meli(
         succeeded=succeeded,
         failed=len(results) - succeeded,
     )
-    return {"message": "No Mercado Libre account connected"}

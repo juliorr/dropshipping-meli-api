@@ -22,9 +22,6 @@ class Settings(BaseSettings):
     # --- Database (meli-api own DB) ---
     database_url: str = "postgresql+asyncpg://meli:meli_dev_2026@meli-postgres:5432/meli_db"
 
-    # --- Backend DB (shared access for products/users until full decoupling) ---
-    backend_database_url: str = "postgresql+asyncpg://dropshipping:dropshipping_dev_2026@postgres:5432/dropshipping_db"
-
     # --- JWT (same secret as backend so tokens are interoperable) ---
     jwt_secret: str = "dev_jwt_secret_key_change_in_production_789def"
     jwt_algorithm: str = "HS256"

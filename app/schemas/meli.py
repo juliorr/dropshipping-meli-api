@@ -83,6 +83,11 @@ class VariationPublishItem(BaseModel):
 class MeliPublishRequest(BaseModel):
     """Request to publish a listing to ML."""
     listing_id: int
+    # Product data (sent by frontend — meli-api is autonomous, no backend DB access)
+    product_id: Optional[int] = None          # For image lookup on local filesystem
+    product_brand: Optional[str] = None       # Brand from Amazon product
+    product_asin: Optional[str] = None        # ASIN for GTIN injection
+    product_title: Optional[str] = None       # Title fallback for model field
     brand: Optional[str] = None
     model: Optional[str] = None
     family_name: Optional[str] = None  # Required by some generic ML categories (e.g. "Otros")
@@ -100,6 +105,7 @@ class MeliPublishResponse(BaseModel):
     meli_item_id: str
     permalink: str
     status: str
+    product_status: Optional[str] = None         # Suggested product status for frontend to update
     warnings: Optional[List[str]] = None         # Non-blocking warnings from ML
     variations_count: Optional[int] = None       # How many variations were actually published
     variations_dropped: Optional[bool] = None    # True if variations were provided but ignored
@@ -120,6 +126,10 @@ class MeliPublishVariantsRequest(BaseModel):
     """Request to publish multiple variants as separate ML items."""
     base_listing_id: int                       # Draft listing with category/description/price
     variations: List[VariantPublishPayload]
+    # Product data (sent by frontend — meli-api is autonomous)
+    product_id: Optional[int] = None          # For image lookup on local filesystem
+    product_brand: Optional[str] = None       # Brand from Amazon product
+    product_asin: Optional[str] = None        # ASIN for GTIN injection
     brand: Optional[str] = None
     family_name: Optional[str] = None          # Required by some generic ML categories
     condition: Optional[str] = "new"
