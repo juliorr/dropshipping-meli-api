@@ -11,7 +11,7 @@ from app.config import settings
 from app.dependencies import get_current_user, get_db
 from app.models.listing import MeliListing
 from app.models.meli_token import MeliToken
-from app.services.image_storage import get_image_paths
+from app.services.image_storage import delete_images, get_image_paths
 from app.schemas.meli import (
     MeliAuthUrlResponse,
     MeliCategoryAttributesResponse,
@@ -888,7 +888,21 @@ async def publish_listing_to_meli(
     listing.meli_permalink = result.get("permalink")
     listing.status = "active"
 
+    # Save ML picture IDs so we can reuse them without local filesystem
+    ml_pictures = result.get("pictures", [])
+    picture_ids = [p["id"] for p in ml_pictures if p.get("id")]
+    if picture_ids:
+        listing.meli_picture_ids = picture_ids
+
     await db.commit()
+
+    # Clean up local images — ML already has them hosted
+    if picture_ids and product_id:
+        try:
+            delete_images(product_id)
+            logger.info(f"Cleaned up local images for product {product_id} after publish")
+        except Exception as e:
+            logger.warning(f"Failed to clean up local images for product {product_id}: {e}")
 
     # Collect any warnings from the response (convert dict objects to strings)
     warnings = None
@@ -932,25 +946,26 @@ async def update_listing_on_meli(
     if not listing.meli_item_id:
         raise HTTPException(status_code=400, detail="Listing has not been published to ML yet")
 
-    # Get product images from local filesystem
-    pictures = get_image_paths(listing.product_id) if listing.product_id else []
-
     # Build update payload (ML only allows certain fields to be updated)
     updates = {
         "price": float(listing.meli_price),
         "available_quantity": listing.available_quantity,
     }
 
-    # Upload pictures to ML first (avoids Amazon CDN hotlink blocking)
-    if pictures:
-        logger.info(f"Uploading {len(pictures)} images for listing update...")
-        picture_entries, upload_warnings = await upload_pictures_to_meli(
-            db, current_user.id, pictures
-        )
-        if picture_entries:
-            updates["pictures"] = picture_entries
-        if upload_warnings:
-            logger.warning(f"Image upload warnings: {upload_warnings}")
+    # Reuse saved ML picture IDs if available, otherwise re-upload from filesystem
+    if listing.meli_picture_ids:
+        updates["pictures"] = [{"id": pid} for pid in listing.meli_picture_ids]
+    else:
+        pictures = get_image_paths(listing.product_id) if listing.product_id else []
+        if pictures:
+            logger.info(f"Uploading {len(pictures)} images for listing update...")
+            picture_entries, upload_warnings = await upload_pictures_to_meli(
+                db, current_user.id, pictures
+            )
+            if picture_entries:
+                updates["pictures"] = picture_entries
+            if upload_warnings:
+                logger.warning(f"Image upload warnings: {upload_warnings}")
 
     result = await update_item(
         db=db,
@@ -1136,7 +1151,21 @@ async def publish_catalog_listing_to_meli(
     listing.meli_permalink = result.get("permalink")
     listing.status = "active"
 
+    # Save ML picture IDs for catalog publish
+    ml_pictures = result.get("pictures", [])
+    picture_ids = [p["id"] for p in ml_pictures if p.get("id")]
+    if picture_ids:
+        listing.meli_picture_ids = picture_ids
+
     await db.commit()
+
+    # Clean up local images — ML already has them hosted
+    if picture_ids and listing.product_id:
+        try:
+            delete_images(listing.product_id)
+            logger.info(f"Cleaned up local images for product {listing.product_id} after catalog publish")
+        except Exception as e:
+            logger.warning(f"Failed to clean up local images for product {listing.product_id}: {e}")
 
     return MeliPublishResponse(
         meli_item_id=listing.meli_item_id,

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import DateTime, Integer, Numeric, String, Text, func
+from sqlalchemy import DateTime, Integer, JSON, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -31,6 +31,7 @@ class MeliListing(Base):
     meli_permalink: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     available_quantity: Mapped[int] = mapped_column(Integer, default=15, nullable=False)
     listing_type: Mapped[str] = mapped_column(String(20), default="gold_special", nullable=False)
+    meli_picture_ids: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

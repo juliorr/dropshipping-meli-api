@@ -8,8 +8,8 @@ Create Date: 2026-03-01
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0003_meli_listings_composite_index"
-down_revision = "0002_add_variation_asin_to_listings"
+revision = "0003_composite_index"
+down_revision = "0002_variation_asin"
 branch_labels = None
 depends_on = None
 

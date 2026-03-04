@@ -164,6 +164,37 @@ async def refresh_meli_tokens():
     logger.info(f"[Scheduler] Token refresh: refreshed={refreshed}, errors={errors}")
 
 
+async def cleanup_published_images():
+    """Delete local images for listings that are already published and have ML picture IDs saved."""
+    logger.info("[Scheduler] Starting cleanup of local images for published listings...")
+    from sqlalchemy import select
+    from app.models.listing import MeliListing
+    from app.services.image_storage import delete_images, get_image_paths
+
+    cleaned = 0
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(MeliListing).where(
+                MeliListing.meli_picture_ids.isnot(None),
+                MeliListing.status.in_(["active", "paused"]),
+            )
+        )
+        listings = result.scalars().all()
+
+        for listing in listings:
+            try:
+                local_images = get_image_paths(listing.product_id)
+                if local_images:
+                    delete_images(listing.product_id)
+                    cleaned += 1
+                    logger.info(f"[Scheduler] Cleaned {len(local_images)} images for product {listing.product_id}")
+            except Exception as e:
+                logger.error(f"[Scheduler] Image cleanup failed for product {listing.product_id}: {e}")
+
+    logger.info(f"[Scheduler] Image cleanup done: cleaned={cleaned} products")
+
+
 async def update_meli_price(listing_id: int, new_price: float) -> dict:
     """Update the price of a specific ML listing. Called on-demand."""
     logger.info(f"[Task] Updating ML price for listing {listing_id} to ${new_price}")
@@ -218,4 +249,11 @@ def setup_scheduler():
         name="Refresh ML tokens",
         replace_existing=True,
     )
-    logger.info("[Scheduler] 4 periodic tasks registered")
+    scheduler.add_job(
+        cleanup_published_images,
+        CronTrigger(minute=0, hour=4),
+        id="cleanup-published-images",
+        name="Cleanup local images for published listings",
+        replace_existing=True,
+    )
+    logger.info("[Scheduler] 5 periodic tasks registered")
