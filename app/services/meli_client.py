@@ -3,6 +3,7 @@
 import asyncio
 import io
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -153,10 +154,26 @@ async def _meli_request(
 
 async def _download_image(url: str) -> Optional[bytes]:
     """
-    Download an image from a URL (e.g. Amazon CDN) using streaming to avoid
-    loading large images fully into memory before the upload.
+    Download an image from a URL (e.g. Amazon CDN) or read from local filesystem path.
     Returns raw bytes or None on failure.
     """
+    # Local filesystem path — read directly from disk
+    if url.startswith("/"):
+        try:
+            path = Path(url)
+            if not path.is_file():
+                logger.warning(f"Local image file not found: {url}")
+                return None
+            image_bytes = path.read_bytes()
+            if len(image_bytes) < 1000:
+                logger.warning(f"Image too small ({len(image_bytes)} bytes), skipping: {url}")
+                return None
+            logger.info(f"Read local image: {url} ({len(image_bytes)} bytes)")
+            return image_bytes
+        except Exception as e:
+            logger.error(f"Error reading local image {url}: {e}")
+            return None
+
     headers = {
         "User-Agent": _DOWNLOAD_USER_AGENT,
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
