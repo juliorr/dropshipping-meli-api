@@ -1,8 +1,8 @@
 """FastAPI dependencies for meli-api."""
 
-from typing import AsyncGenerator, NamedTuple
+from typing import AsyncGenerator, NamedTuple, Optional
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,7 +10,7 @@ from app.config import settings
 from app.database import async_session
 from app.utils.security import decode_token
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 class AuthUser(NamedTuple):
@@ -29,10 +29,12 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> AuthUser:
     """
     Validate JWT and return user identity.
+    Accepts token from httpOnly cookie or Authorization header.
     The meli-api shares the same JWT_SECRET as the backend so tokens issued
     by the backend are accepted here without a separate login.
     No DB lookup — user_id and is_superuser are embedded in the token payload.
@@ -43,7 +45,14 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
 
-    payload = decode_token(credentials.credentials)
+    # Try httpOnly cookie first, then Authorization header
+    token = request.cookies.get("access_token")
+    if not token and credentials:
+        token = credentials.credentials
+    if not token:
+        raise credentials_exception
+
+    payload = decode_token(token)
     if payload is None or payload.get("type") != "access":
         raise credentials_exception
 
