@@ -1,6 +1,5 @@
 """Meli-API configuration using Pydantic Settings."""
 
-import os
 from typing import List
 
 from pydantic import model_validator

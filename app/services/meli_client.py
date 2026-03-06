@@ -830,20 +830,6 @@ async def update_item(
     )
 
 
-async def pause_item(
-    db: AsyncSession, user_id: int, meli_item_id: str
-) -> Optional[Dict[str, Any]]:
-    """Pause an ML listing."""
-    return await update_item(db, user_id, meli_item_id, {"status": "paused"})
-
-
-async def activate_item(
-    db: AsyncSession, user_id: int, meli_item_id: str
-) -> Optional[Dict[str, Any]]:
-    """Activate/reactivate an ML listing."""
-    return await update_item(db, user_id, meli_item_id, {"status": "active"})
-
-
 async def close_item(
     db: AsyncSession, user_id: int, meli_item_id: str
 ) -> Optional[Dict[str, Any]]:
@@ -892,27 +878,3 @@ async def get_user_info(
     """Get the ML user info for the connected account."""
     return await _meli_request(db, user_id, "GET", "/users/me")
 
-
-async def get_questions(
-    db: AsyncSession,
-    user_id: int,
-    meli_item_id: str,
-) -> Optional[Dict[str, Any]]:
-    """Get questions for a specific item."""
-    return await _meli_request(
-        db, user_id, "GET", f"/questions/search",
-        params={"item": meli_item_id},
-    )
-
-
-async def answer_question(
-    db: AsyncSession,
-    user_id: int,
-    question_id: int,
-    answer_text: str,
-) -> Optional[Dict[str, Any]]:
-    """Answer a buyer's question."""
-    return await _meli_request(
-        db, user_id, "POST", f"/answers",
-        json_data={"question_id": question_id, "text": answer_text},
-    )

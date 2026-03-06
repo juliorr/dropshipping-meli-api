@@ -23,7 +23,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.dependencies import get_db
 from app.routers.mercadolibre import router as meli_router
 from app.routers.listings import router as listings_router
