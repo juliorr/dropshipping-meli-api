@@ -52,6 +52,10 @@ class Settings(BaseSettings):
             errors.append("MELI_CLIENT_SECRET is required in production")
         if self.meli_api_key == "dev_meli_api_key_change_in_production":
             errors.append("MELI_API_KEY must be changed in production")
+        if self.jwt_secret == "dev_jwt_secret_key_change_in_production_789def":
+            errors.append("JWT_SECRET must be changed in production")
+        if len(self.jwt_secret) < 32:
+            errors.append("JWT_SECRET must be at least 32 characters")
         if errors:
             raise ValueError(
                 "Production environment validation failed:\n  - " + "\n  - ".join(errors)

@@ -166,15 +166,13 @@ async def meli_callback(
     Exchanges the authorization code for access/refresh tokens.
     Returns an HTML page with the result.
     """
-    try:
-        user_id = int(state)
-    except (ValueError, TypeError):
+    if not state:
         return HTMLResponse(
-            content=_build_callback_html(False, "Parámetro de estado inválido."),
+            content=_build_callback_html(False, "Parámetro de estado vacío."),
             status_code=400,
         )
 
-    token = await exchange_code_for_tokens(db, user_id, code)
+    token = await exchange_code_for_tokens(db, state, code)
     if token is None:
         return HTMLResponse(
             content=_build_callback_html(

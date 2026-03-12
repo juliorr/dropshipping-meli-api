@@ -40,6 +40,9 @@ async def get_auth_url(user_id: int) -> str:
     """
     Generate the ML OAuth authorization URL with PKCE challenge.
 
+    Uses a cryptographic nonce as the OAuth state parameter instead of user_id
+    to prevent CSRF attacks. The nonce maps back to user_id via Redis.
+
     NOTE: If you get 403 PA_UNAUTHORIZED_RESULT_FROM_POLICIES when publishing,
     ensure in the ML Developer Portal (https://developers.mercadolibre.com.mx/devcenter):
     1. Your app has "write" scope enabled in Scopes/Permisos
@@ -49,37 +52,51 @@ async def get_auth_url(user_id: int) -> str:
     code_verifier = _generate_code_verifier()
     code_challenge = _generate_code_challenge(code_verifier)
 
-    # Store code_verifier in memory keyed by user_id
-    await cache.set(f"meli_pkce:{user_id}", code_verifier, ex=PKCE_VERIFIER_TTL)
+    # Generate a cryptographic nonce for the state parameter (CSRF protection)
+    state_nonce = secrets.token_urlsafe(32)
+
+    # Store user_id and code_verifier in cache keyed by nonce
+    await cache.set(f"meli_oauth_state:{state_nonce}", str(user_id), ex=PKCE_VERIFIER_TTL)
+    await cache.set(f"meli_pkce:{state_nonce}", code_verifier, ex=PKCE_VERIFIER_TTL)
 
     return (
         f"{MELI_AUTH_URL}"
         f"?response_type=code"
         f"&client_id={settings.meli_client_id}"
         f"&redirect_uri={settings.meli_redirect_uri}"
-        f"&state={user_id}"
+        f"&state={state_nonce}"
         f"&code_challenge={code_challenge}"
         f"&code_challenge_method=S256"
     )
 
 
 async def exchange_code_for_tokens(
-    db: AsyncSession, user_id: int, code: str
+    db: AsyncSession, state_nonce: str, code: str
 ) -> Optional[MeliToken]:
     """
     Exchange an authorization code for access/refresh tokens (with PKCE).
-    Retrieves code_verifier from Redis and sends it along.
+    Retrieves user_id and code_verifier from Redis using the state nonce.
+    Both cache entries are single-use and deleted after retrieval.
     Stores tokens in the database linked to the user.
     """
     try:
-        # Retrieve code_verifier from cache
-        code_verifier = await cache.get(f"meli_pkce:{user_id}")
-        if not code_verifier:
-            logger.error(f"No PKCE code_verifier found for user {user_id}")
+        # Retrieve user_id from cache using state nonce
+        cached_user_id = await cache.get(f"meli_oauth_state:{state_nonce}")
+        if not cached_user_id:
+            logger.error(f"No OAuth state found for nonce (expired or invalid)")
             return None
 
-        # Delete used verifier
-        await cache.delete(f"meli_pkce:{user_id}")
+        user_id = int(cached_user_id)
+
+        # Retrieve code_verifier from cache
+        code_verifier = await cache.get(f"meli_pkce:{state_nonce}")
+        if not code_verifier:
+            logger.error(f"No PKCE code_verifier found for nonce")
+            return None
+
+        # Delete used entries (single-use nonce)
+        await cache.delete(f"meli_oauth_state:{state_nonce}")
+        await cache.delete(f"meli_pkce:{state_nonce}")
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
