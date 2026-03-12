@@ -2,15 +2,49 @@
 
 import asyncio
 import io
+import ipaddress
 import logging
+import socket
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
 from PIL import Image
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.meli_auth import get_valid_token
+
+# ── SSRF protection for image downloads ──────────────────────────────────────
+# Allowed base directory for local file reads
+_ALLOWED_LOCAL_BASE = Path("/app/media")
+
+# Docker internal service hostnames to block
+_BLOCKED_HOSTNAMES = frozenset({
+    "redis", "meli-redis", "postgres", "meli-postgres",
+    "backend", "frontend", "meli-api", "flower", "nginx",
+    "localhost", "host.docker.internal",
+})
+
+
+def _is_safe_url(url: str) -> bool:
+    """Check that a URL does not point to internal/private resources."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    hostname = parsed.hostname or ""
+    if hostname in _BLOCKED_HOSTNAMES:
+        return False
+    # Block private/reserved IPs (cloud metadata, internal networks)
+    try:
+        addrs = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for addr_info in addrs:
+            ip = ipaddress.ip_address(addr_info[4][0])
+            if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
+                return False
+    except (socket.gaierror, ValueError, OSError):
+        pass  # DNS resolution failed — allow httpx to handle the error
+    return True
 
 # ── Retry configuration ───────────────────────────────────────────────────────
 # Maximum number of retry attempts for transient ML API errors (5xx, timeouts)
@@ -61,15 +95,17 @@ async def _meli_request(
             if "pictures" in _log_data and isinstance(_log_data["pictures"], list):
                 _log_data["pictures"] = f"[{len(_log_data['pictures'])} pictures omitted]"
             _json_str = _json.dumps(_log_data, ensure_ascii=False, indent=2)
+            _redacted = f"***{access_token[-4:]}" if len(access_token) >= 4 else "***"
             logger.warning(
                 f"[ML API CURL] curl -X {method} '{url}' \\\n"
-                f"  -H 'Authorization: Bearer {access_token}' \\\n"
+                f"  -H 'Authorization: Bearer {_redacted}' \\\n"
                 f"  -H 'Content-Type: application/json' \\\n"
                 f"  -d '{_json_str}'"
             )
         else:
             _params_str = f"?{'&'.join(f'{k}={v}' for k,v in (params or {}).items())}" if params else ""
-            logger.warning(f"[ML API CURL] curl -X {method} '{url}{_params_str}' -H 'Authorization: Bearer {access_token}'")
+            _redacted = f"***{access_token[-4:]}" if len(access_token) >= 4 else "***"
+            logger.warning(f"[ML API CURL] curl -X {method} '{url}{_params_str}' -H 'Authorization: Bearer {_redacted}'")
 
         async with httpx.AsyncClient() as client:
             response = await client.request(
@@ -157,10 +193,13 @@ async def _download_image(url: str) -> Optional[bytes]:
     Download an image from a URL (e.g. Amazon CDN) or read from local filesystem path.
     Returns raw bytes or None on failure.
     """
-    # Local filesystem path — read directly from disk
+    # Local filesystem path — restricted to /app/media/ to prevent path traversal
     if url.startswith("/"):
         try:
-            path = Path(url)
+            path = Path(url).resolve()
+            if not path.is_relative_to(_ALLOWED_LOCAL_BASE):
+                logger.warning(f"Local path outside allowed directory, blocked: {url}")
+                return None
             if not path.is_file():
                 logger.warning(f"Local image file not found: {url}")
                 return None
@@ -173,6 +212,11 @@ async def _download_image(url: str) -> Optional[bytes]:
         except Exception as e:
             logger.error(f"Error reading local image {url}: {e}")
             return None
+
+    # Block SSRF: prevent requests to internal services and private IPs
+    if not _is_safe_url(url):
+        logger.warning(f"Blocked SSRF attempt in image download: {url}")
+        return None
 
     headers = {
         "User-Agent": _DOWNLOAD_USER_AGENT,

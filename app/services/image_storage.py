@@ -30,9 +30,14 @@ async def save_images(product_id: int, files: list[tuple[str, bytes]]) -> list[s
     dest = _product_dir(product_id)
     dest.mkdir(parents=True, exist_ok=True)
 
+    ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
     saved: list[str] = []
     for i, (filename, content) in enumerate(files):
-        ext = Path(filename).suffix or ".jpg"
+        ext = Path(filename).suffix.lower() or ".jpg"
+        if ext not in ALLOWED_EXTENSIONS:
+            logger.warning(f"Rejected image with disallowed extension '{ext}': {filename}")
+            continue
         safe_name = f"image_{i}{ext}"
         filepath = dest / safe_name
         filepath.write_bytes(content)

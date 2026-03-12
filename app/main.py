@@ -36,8 +36,8 @@ app = FastAPI(
     title="Meli-API — MercadoLibre Integration",
     description="Servicio independiente para integración con MercadoLibre",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if settings.environment != "production" else None,
+    redoc_url="/redoc" if settings.environment != "production" else None,
 )
 
 app.add_middleware(

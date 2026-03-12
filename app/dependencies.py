@@ -1,5 +1,6 @@
 """FastAPI dependencies for meli-api."""
 
+import secrets
 from typing import AsyncGenerator, NamedTuple, Optional
 
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -70,7 +71,7 @@ async def verify_api_key(x_api_key: str = Header(...)) -> None:
     """
     Verify service-to-service API Key used by the backend when calling meli-api.
     """
-    if x_api_key != settings.meli_api_key:
+    if not secrets.compare_digest(x_api_key, settings.meli_api_key):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key",

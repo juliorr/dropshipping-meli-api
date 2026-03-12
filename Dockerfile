@@ -24,15 +24,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+# Create non-root user
+RUN addgroup --gid 1001 appgroup && adduser --uid 1001 --gid 1001 --disabled-password --gecos "" appuser
+
+COPY --from=builder /root/.local /home/appuser/.local
+ENV PATH=/home/appuser/.local/bin:$PATH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY . .
+# Create media directory accessible to appuser
+RUN mkdir -p /app/media && chown -R appuser:appgroup /app/media
+
+COPY --chown=appuser:appgroup . .
 
 EXPOSE 8001
+
+USER appuser
 
 CMD alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8001

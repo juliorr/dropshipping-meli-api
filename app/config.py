@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> List[str]:
         return [origin.strip() for origin in self.cors_origins.split(",")]
 
+    # --- Token encryption (Fernet) ---
+    token_encryption_key: str = ""  # Fernet key for encrypting MeLi tokens at rest
+
     # --- Mercado Libre OAuth ---
     meli_client_id: str = ""
     meli_client_secret: str = ""
@@ -56,6 +59,8 @@ class Settings(BaseSettings):
             errors.append("JWT_SECRET must be changed in production")
         if len(self.jwt_secret) < 32:
             errors.append("JWT_SECRET must be at least 32 characters")
+        if not self.token_encryption_key:
+            errors.append("TOKEN_ENCRYPTION_KEY is required in production")
         if errors:
             raise ValueError(
                 "Production environment validation failed:\n  - " + "\n  - ".join(errors)

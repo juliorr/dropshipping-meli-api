@@ -34,7 +34,8 @@ async def list_listings(
     if status_filter:
         query = query.where(MeliListing.status == status_filter)
     if search:
-        query = query.where(MeliListing.title.ilike(f"%{search}%"))
+        safe_search = search.replace("%", r"\%").replace("_", r"\_")
+        query = query.where(MeliListing.title.ilike(f"%{safe_search}%"))
 
     count_q = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_q)).scalar() or 0

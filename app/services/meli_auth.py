@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache import cache
 from app.config import settings
 from app.models.meli_token import MeliToken
+from app.utils.encryption import decrypt_token, encrypt_token
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +138,8 @@ async def exchange_code_for_tokens(
         existing = result.scalar_one_or_none()
 
         if existing:
-            existing.access_token = access_token
-            existing.refresh_token = refresh_token
+            existing.access_token = encrypt_token(access_token)
+            existing.refresh_token = encrypt_token(refresh_token)
             existing.token_type = token_type
             existing.expires_at = expires_at
             existing.meli_user_id = meli_user_id
@@ -146,8 +147,8 @@ async def exchange_code_for_tokens(
         else:
             token_obj = MeliToken(
                 user_id=user_id,
-                access_token=access_token,
-                refresh_token=refresh_token,
+                access_token=encrypt_token(access_token),
+                refresh_token=encrypt_token(refresh_token),
                 token_type=token_type,
                 expires_at=expires_at,
                 meli_user_id=meli_user_id,
@@ -203,7 +204,7 @@ async def refresh_meli_token(
                         "grant_type": "refresh_token",
                         "client_id": settings.meli_client_id,
                         "client_secret": settings.meli_client_secret,
-                        "refresh_token": token_obj.refresh_token,
+                        "refresh_token": decrypt_token(token_obj.refresh_token),
                     },
                     headers={"Content-Type": "application/json"},
                     timeout=15.0,
@@ -214,8 +215,8 @@ async def refresh_meli_token(
                 return None
 
             data = response.json()
-            token_obj.access_token = data["access_token"]
-            token_obj.refresh_token = data["refresh_token"]
+            token_obj.access_token = encrypt_token(data["access_token"])
+            token_obj.refresh_token = encrypt_token(data["refresh_token"])
             token_obj.expires_at = datetime.now(timezone.utc) + timedelta(
                 seconds=data.get("expires_in", 21600)
             )
@@ -252,4 +253,4 @@ async def get_valid_token(
         if not token_obj:
             return None
 
-    return token_obj.access_token
+    return decrypt_token(token_obj.access_token)
