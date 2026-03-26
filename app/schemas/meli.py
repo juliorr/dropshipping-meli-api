@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import List, Optional, Dict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class MeliAuthUrlResponse(BaseModel):
@@ -97,6 +97,7 @@ class MeliPublishRequest(BaseModel):
     warranty_time: Optional[str] = None  # "90 días", "6 meses", "1 año", etc.
     shipping_mode: Optional[str] = None  # "me2" | "me1" | "not_specified" | "custom"
     free_shipping: Optional[bool] = None
+    manufacturing_time: Optional[int] = Field(None, ge=1, le=45)  # Days for product availability (1-45)
     variations: Optional[List[VariationPublishItem]] = None  # Per-variant prices/quantities/images
 
 
@@ -137,4 +138,5 @@ class MeliPublishVariantsRequest(BaseModel):
     warranty_time: Optional[str] = None
     shipping_mode: Optional[str] = None
     free_shipping: Optional[bool] = None
+    manufacturing_time: Optional[int] = Field(None, ge=1, le=45)  # Days for product availability (1-45)
     attributes: Optional[List[MeliPublishAttribute]] = None

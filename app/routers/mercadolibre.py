@@ -568,6 +568,12 @@ async def publish_listing_to_meli(
             {"id": "WARRANTY_TIME", "value_name": data.warranty_time or ""},
         ]
 
+    # Add manufacturing time (product availability days) if provided
+    if data.manufacturing_time:
+        if sale_terms is None:
+            sale_terms = []
+        sale_terms.append({"id": "MANUFACTURING_TIME", "value_name": f"{data.manufacturing_time} días"})
+
     # Build shipping config
     shipping = None
     if data.shipping_mode or data.free_shipping is not None:
@@ -1297,6 +1303,12 @@ async def publish_variants_to_meli(
             {"id": "WARRANTY_TYPE", "value_name": data.warranty_type},
             {"id": "WARRANTY_TIME", "value_name": data.warranty_time or ""},
         ]
+
+    # Add manufacturing time (product availability days) if provided
+    if data.manufacturing_time:
+        if sale_terms is None:
+            sale_terms = []
+        sale_terms.append({"id": "MANUFACTURING_TIME", "value_name": f"{data.manufacturing_time} días"})
 
     # Build shipping
     shipping = None
