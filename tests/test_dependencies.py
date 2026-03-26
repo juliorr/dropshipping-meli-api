@@ -19,6 +19,7 @@ from app.dependencies import AuthUser, get_current_user, verify_api_key
 def make_token(
     user_id: int = 1,
     is_superuser: bool = False,
+    role: str = "user",
     token_type: str = "access",
     expires_delta: timedelta = timedelta(minutes=30),
     secret: str | None = None,
@@ -27,6 +28,7 @@ def make_token(
     payload = {
         "sub": str(user_id),
         "is_superuser": is_superuser,
+        "role": role,
         "type": token_type,
         "exp": expire,
     }
@@ -52,21 +54,23 @@ def make_credentials(token: str) -> HTTPAuthorizationCredentials:
 
 @pytest.mark.asyncio
 async def test_get_current_user_valid_token():
-    token = make_token(user_id=42, is_superuser=True)
+    token = make_token(user_id=42, is_superuser=True, role="admin")
     user = await get_current_user(make_request(), make_credentials(token))
 
     assert isinstance(user, AuthUser)
     assert user.id == 42
     assert user.is_superuser is True
+    assert user.role == "admin"
 
 
 @pytest.mark.asyncio
 async def test_get_current_user_valid_non_superuser():
-    token = make_token(user_id=7, is_superuser=False)
+    token = make_token(user_id=7, is_superuser=False, role="user")
     user = await get_current_user(make_request(), make_credentials(token))
 
     assert user.id == 7
     assert user.is_superuser is False
+    assert user.role == "user"
 
 
 @pytest.mark.asyncio

@@ -16,11 +16,12 @@ from app.main import app
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_token(user_id: int = 1, is_superuser: bool = False) -> str:
+def make_token(user_id: int = 1, is_superuser: bool = False, role: str = "user") -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=30)
     payload = {
         "sub": str(user_id),
         "is_superuser": is_superuser,
+        "role": role,
         "type": "access",
         "exp": expire,
     }

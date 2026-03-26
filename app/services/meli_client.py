@@ -167,7 +167,12 @@ async def _meli_request(
             logger.warning(log_msg)
 
         logger.warning(f"[ML API FULL RESPONSE] {response.text[:2000]}")
-        return {"error": True, "status": response.status_code, "detail": response.text}
+        err_result: Dict[str, Any] = {"error": True, "status": response.status_code, "detail": response.text}
+        try:
+            err_result.update(response.json())  # merge ML fields (error, message, cause)
+        except Exception:
+            pass
+        return err_result
 
       except httpx.TimeoutException as e:
         if attempt < _ML_MAX_RETRIES:
@@ -799,6 +804,25 @@ async def publish_item(
 
     logger.info(f"Publishing item to ML with {len(attributes)} attributes: {[a['id'] for a in attributes]}")
     result = await _meli_request(db, user_id, "POST", "/items", json_data=item_data)
+
+    # Fallback: if ML rejects family_name as invalid, retry with title mode.
+    # Some categories don't support family_name even when the caller requests it.
+    if family_name and result and result.get("error") == "validation_error":
+        causes = result.get("cause", [])
+        family_invalid = any(
+            c.get("code") == "body.invalid_fields"
+            and "family name" in c.get("message", "").lower()
+            for c in causes
+        )
+        if family_invalid:
+            logger.warning(
+                f"ML rejected family_name for category {category_id} — "
+                f"retrying with title mode (title={enriched_title!r})"
+            )
+            item_data.pop("family_name", None)
+            item_data["title"] = enriched_title
+            result = await _meli_request(db, user_id, "POST", "/items", json_data=item_data)
+
     if result and not result.get("error"):
         item_id = result.get("id")
         logger.info(f"Item published on ML: {item_id} for user {user_id}")

@@ -14,13 +14,15 @@ logger = logging.getLogger(__name__)
 
 async def get_orders(
     db: AsyncSession,
-    user_id: int,
+    user_id: Optional[int] = None,
     page: int = 1,
     page_size: int = 20,
     status: Optional[str] = None,
 ) -> dict:
-    """Get paginated orders for a user."""
-    query = select(Order).where(Order.user_id == user_id)
+    """Get paginated orders. If user_id is None, return all orders (operator/admin)."""
+    query = select(Order)
+    if user_id is not None:
+        query = query.where(Order.user_id == user_id)
 
     if status:
         query = query.where(Order.status == status)
@@ -46,10 +48,12 @@ async def get_orders(
 
 
 async def get_order_by_id(
-    db: AsyncSession, order_id: int, user_id: int
+    db: AsyncSession, order_id: int, user_id: Optional[int] = None
 ) -> Optional[Order]:
-    """Get a single order by ID."""
-    query = select(Order).where(Order.id == order_id, Order.user_id == user_id)
+    """Get a single order by ID. If user_id is None, no user filter (operator/admin)."""
+    query = select(Order).where(Order.id == order_id)
+    if user_id is not None:
+        query = query.where(Order.user_id == user_id)
     result = await db.execute(query)
     return result.scalar_one_or_none()
 

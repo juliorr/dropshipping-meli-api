@@ -1492,6 +1492,14 @@ async def publish_variants_to_meli(
                 await db.rollback()
             except Exception:
                 pass
+            # Ensure a fresh transaction exists for the next iteration;
+            # after rollback the session has no active transaction and
+            # begin_nested() would fail with a greenlet_spawn error.
+            try:
+                if not db.in_transaction():
+                    await db.begin()
+            except Exception:
+                pass
             results.append(ListingVariantResult(
                 variation_asin=variation_asin,
                 variant_name=dim_label,

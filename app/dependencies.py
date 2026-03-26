@@ -18,6 +18,7 @@ class AuthUser(NamedTuple):
     """Lightweight user representation extracted from JWT — no DB lookup needed."""
     id: int
     is_superuser: bool
+    role: str
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -64,6 +65,7 @@ async def get_current_user(
     return AuthUser(
         id=int(user_id),
         is_superuser=payload.get("is_superuser", False),
+        role=payload.get("role", "user"),
     )
 
 

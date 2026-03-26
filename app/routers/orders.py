@@ -20,8 +20,10 @@ async def list_orders(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List orders for the current user."""
-    result = await get_orders(db, current_user.id, page=page, page_size=page_size, status=status)
+    """List orders. Operators and admins see all orders; regular users see their own."""
+    # Operators and admins see all orders (cross-user)
+    user_id = None if current_user.role in ("operator", "admin") else current_user.id
+    result = await get_orders(db, user_id=user_id, page=page, page_size=page_size, status=status)
     return result
 
 
@@ -31,6 +33,11 @@ async def sync_orders(
     db: AsyncSession = Depends(get_db),
 ):
     """Manually sync orders from Mercado Libre for the current user."""
+    if current_user.role == "operator":
+        raise HTTPException(
+            status_code=403,
+            detail="Operators cannot sync orders — no Mercado Libre account linked",
+        )
     result = await sync_orders_for_user(db, current_user.id)
     return result
 
@@ -42,7 +49,9 @@ async def get_order(
     db: AsyncSession = Depends(get_db),
 ):
     """Get order details."""
-    order = await get_order_by_id(db, order_id, current_user.id)
+    # Operators and admins can view any order
+    user_id = None if current_user.role in ("operator", "admin") else current_user.id
+    order = await get_order_by_id(db, order_id, user_id=user_id)
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
     return order

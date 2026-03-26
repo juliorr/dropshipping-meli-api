@@ -16,6 +16,7 @@ from app.main import app
 def make_jwt(
     user_id: int = 1,
     is_superuser: bool = False,
+    role: str = "user",
     token_type: str = "access",
     expires_delta: timedelta = timedelta(minutes=30),
 ) -> str:
@@ -23,6 +24,7 @@ def make_jwt(
     payload = {
         "sub": str(user_id),
         "is_superuser": is_superuser,
+        "role": role,
         "type": token_type,
         "exp": expire,
     }
@@ -31,12 +33,12 @@ def make_jwt(
 
 @pytest.fixture
 def valid_jwt_token() -> str:
-    return make_jwt(user_id=1, is_superuser=False)
+    return make_jwt(user_id=1, is_superuser=False, role="user")
 
 
 @pytest.fixture
 def superuser_jwt_token() -> str:
-    return make_jwt(user_id=99, is_superuser=True)
+    return make_jwt(user_id=99, is_superuser=True, role="admin")
 
 
 @pytest.fixture
