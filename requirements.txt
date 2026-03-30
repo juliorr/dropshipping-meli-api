@@ -29,5 +29,8 @@ Pillow==11.1.0
 pytest==8.3.4
 pytest-asyncio==0.24.0
 
+# ===== AI (LLM auto-remediation) =====
+anthropic>=0.70.0,<1.0.0
+
 # ===== Utilities =====
 python-dotenv==1.0.1

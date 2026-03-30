@@ -28,6 +28,7 @@ from app.routers.mercadolibre import router as meli_router
 from app.routers.listings import router as listings_router
 from app.routers.orders import router as orders_router
 from app.routers.images import router as images_router, media_router
+from app.routers.remediation import router as remediation_router
 from app.scheduler import scheduler, setup_scheduler
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ app.include_router(listings_router)
 app.include_router(orders_router)
 app.include_router(images_router)
 app.include_router(media_router)
+app.include_router(remediation_router)
 
 
 @app.get("/", tags=["Health"])
@@ -91,6 +93,13 @@ async def startup_scheduler():
     setup_scheduler()
     scheduler.start()
     logger.info("[Startup] Background scheduler started")
+
+    # Load runtime config from DB into memory
+    try:
+        from app.services.runtime_config import load_config_cache
+        await load_config_cache()
+    except Exception as e:
+        logger.warning(f"[Startup] Could not load runtime config: {e}")
 
     # Sync categories if cache is empty
     try:

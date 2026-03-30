@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import DateTime, Integer, JSON, Numeric, String, Text, func
+from sqlalchemy import Boolean, DateTime, Integer, JSON, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -14,6 +14,12 @@ if TYPE_CHECKING:
 
 class MeliListing(Base):
     __tablename__ = "meli_listings"
+    __table_args__ = (
+        # Partial unique index: only one non-closed listing per (product_id, user_id, variation_asin).
+        # Defined via raw SQL in migration 0007 (PostgreSQL partial index with COALESCE).
+        # Index name: uq_meli_listings_active_product_variation
+        # WHERE status != 'closed' — allows re-publishing after closing a listing.
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     # user_id and product_id are logical FKs to the backend DB (no FK constraint)
@@ -31,6 +37,7 @@ class MeliListing(Base):
     meli_permalink: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     available_quantity: Mapped[int] = mapped_column(Integer, default=15, nullable=False)
     listing_type: Mapped[str] = mapped_column(String(20), default="gold_special", nullable=False)
+    paused_by_stock: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     meli_picture_ids: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

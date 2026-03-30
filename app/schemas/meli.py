@@ -131,6 +131,8 @@ class MeliPublishVariantsRequest(BaseModel):
     product_id: Optional[int] = None          # For image lookup on local filesystem
     product_brand: Optional[str] = None       # Brand from Amazon product
     product_asin: Optional[str] = None        # ASIN for GTIN injection
+    product_title: Optional[str] = None       # Title fallback for model field
+    model: Optional[str] = None               # Model name for ML MODEL attribute
     brand: Optional[str] = None
     family_name: Optional[str] = None          # Required by some generic ML categories
     condition: Optional[str] = "new"

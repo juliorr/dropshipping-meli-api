@@ -219,6 +219,129 @@ async def update_meli_price(listing_id: int, new_price: float) -> dict:
         return {"status": "failed", "detail": str(result)}
 
 
+async def retry_unremediated_errors():
+    """Retry errors that had no matching rule but may now have an LLM-created rule.
+
+    Runs every 30 minutes. Picks up errors where remediation was not attempted
+    (no rules existed at the time) and checks if a new rule has been created since.
+    """
+    from app.services.runtime_config import get_config_bool
+
+    if not get_config_bool("llm_fix_enabled"):
+        return
+
+    logger.info("[Scheduler] Starting unremediated error retry...")
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from app.models.remediation import PublishErrorLog, RemediationRule
+    from app.services.remediation_engine import attempt_remediation
+
+    retried = 0
+    fixed = 0
+
+    async with async_session() as db:
+        # Find errors from the last 24 hours that were not remediated
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        stmt = (
+            select(PublishErrorLog)
+            .where(
+                PublishErrorLog.remediation_attempted.is_(False),
+                PublishErrorLog.created_at >= cutoff,
+            )
+            .order_by(PublishErrorLog.created_at.desc())
+            .limit(20)
+        )
+        errors = (await db.execute(stmt)).scalars().all()
+
+        for error_log in errors:
+            # Check if a rule now exists for this error code
+            rule_exists = (
+                await db.execute(
+                    select(RemediationRule.id).where(
+                        RemediationRule.error_code == error_log.error_code,
+                        RemediationRule.is_active.is_(True),
+                    ).limit(1)
+                )
+            ).scalar_one_or_none()
+
+            if not rule_exists:
+                continue
+
+            retried += 1
+            try:
+                result = await attempt_remediation(
+                    db=db,
+                    user_id=error_log.user_id,
+                    listing_id=error_log.listing_id,
+                    product_id=error_log.product_id,
+                    meli_category_id=error_log.meli_category_id,
+                    original_result=error_log.ml_response,
+                    publish_kwargs=error_log.publish_payload,
+                    max_attempts=1,
+                )
+                if result and not result.get("error"):
+                    fixed += 1
+            except Exception as e:
+                logger.error(
+                    f"[Scheduler] Retry failed for error_log #{error_log.id}: {e}"
+                )
+
+    logger.info(
+        f"[Scheduler] Unremediated retry: checked={len(errors)}, "
+        f"retried={retried}, fixed={fixed}"
+    )
+
+
+async def detect_promotable_rules():
+    """Find rules ready for code promotion and log them.
+
+    Runs daily at 2 AM. A rule is promotable when it has enough successes,
+    high confidence, and has been active long enough.
+    """
+    logger.info("[Scheduler] Checking for promotable remediation rules...")
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from app.config import settings as app_settings
+    from app.models.remediation import RemediationRule
+
+    async with async_session() as db:
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=app_settings.pr_promotion_min_age_days
+        )
+        stmt = (
+            select(RemediationRule)
+            .where(
+                RemediationRule.is_active.is_(True),
+                RemediationRule.promoted_to_code.is_(False),
+                RemediationRule.source.in_(["llm", "manual"]),
+                RemediationRule.success_count >= app_settings.pr_promotion_min_successes,
+                RemediationRule.confidence_score >= app_settings.pr_promotion_min_confidence,
+                RemediationRule.created_at <= cutoff,
+            )
+            .order_by(RemediationRule.success_count.desc())
+            .limit(5)
+        )
+        rules = (await db.execute(stmt)).scalars().all()
+
+        if not rules:
+            logger.info("[Scheduler] No rules ready for promotion.")
+            return
+
+        for rule in rules:
+            logger.info(
+                f"[Scheduler] PROMOTABLE RULE #{rule.id}: {rule.name} "
+                f"(success={rule.success_count}, confidence={rule.confidence_score:.2%}, "
+                f"source={rule.source}). "
+                f"Use POST /remediation/promote/{rule.id} to generate code."
+            )
+
+    logger.info(f"[Scheduler] Found {len(rules)} promotable rule(s).")
+
+
 def setup_scheduler():
     """Register all periodic tasks."""
     scheduler.add_job(
@@ -256,4 +379,18 @@ def setup_scheduler():
         name="Cleanup local images for published listings",
         replace_existing=True,
     )
-    logger.info("[Scheduler] 5 periodic tasks registered")
+    scheduler.add_job(
+        retry_unremediated_errors,
+        CronTrigger(minute="*/30"),
+        id="retry-unremediated-errors",
+        name="Retry errors with new LLM rules",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        detect_promotable_rules,
+        CronTrigger(minute=0, hour=2),
+        id="detect-promotable-rules",
+        name="Detect rules ready for code promotion",
+        replace_existing=True,
+    )
+    logger.info("[Scheduler] 7 periodic tasks registered")

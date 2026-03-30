@@ -4,6 +4,7 @@ import asyncio
 import io
 import ipaddress
 import logging
+import re
 import socket
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -12,6 +13,8 @@ from urllib.parse import urlparse
 import httpx
 from PIL import Image
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from sqlalchemy import select
 
 from app.services.meli_auth import get_valid_token
 
@@ -58,11 +61,22 @@ logger = logging.getLogger(__name__)
 
 MELI_API_BASE = "https://api.mercadolibre.com"
 
-# User-Agent to use when downloading images from Amazon (avoids hotlink blocking)
-_DOWNLOAD_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
+# User-Agents to use when downloading images from Amazon (avoids hotlink blocking).
+# Multiple agents are tried in order if earlier ones get blocked (403/429).
+_DOWNLOAD_USER_AGENTS = [
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+]
 
 
 async def _meli_request(
@@ -193,10 +207,36 @@ async def _meli_request(
     return None  # All retries exhausted
 
 
+def _normalize_amazon_image_url(url: str) -> str:
+    """
+    Normalize Amazon CDN image URLs to request high-resolution versions.
+    Amazon image URLs contain size/format directives like ``._AC_SL1500_.``
+    If the URL has a small-size directive (e.g. ``_SL100_``, ``_SS40_``), replace
+    it with ``_SL1500_`` so we always fetch a large image that meets ML's 500px minimum.
+    """
+    if "media-amazon.com" not in url and "images-amazon.com" not in url:
+        return url
+    # Replace small size directives with high-res (SL1500)
+    normalized = re.sub(
+        r"\._[A-Z]{2}_S[LSXY]\d{2,4}_\.",  # e.g. ._AC_SL100_. or ._SS40_.
+        "._AC_SL1500_.",
+        url,
+    )
+    return normalized
+
+
+# Max image size we accept: 20 MB
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+
 async def _download_image(url: str) -> Optional[bytes]:
     """
     Download an image from a URL (e.g. Amazon CDN) or read from local filesystem path.
     Returns raw bytes or None on failure.
+
+    For remote URLs, retries with different User-Agent strings to work around
+    Amazon CDN hotlink blocking (403).  Amazon image URLs are also normalized
+    to request a high-resolution variant.
     """
     # Local filesystem path — restricted to /app/media/ to prevent path traversal
     if url.startswith("/"):
@@ -223,43 +263,64 @@ async def _download_image(url: str) -> Optional[bytes]:
         logger.warning(f"Blocked SSRF attempt in image download: {url}")
         return None
 
-    headers = {
-        "User-Agent": _DOWNLOAD_USER_AGENT,
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.amazon.com/",
-    }
-    # Max image size we accept: 20 MB. Bail out early to protect memory.
-    _MAX_IMAGE_BYTES = 20 * 1024 * 1024
-    try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            async with client.stream("GET", url, headers=headers, timeout=30.0) as resp:
-                if resp.status_code != 200:
-                    logger.warning(
-                        f"Image download failed: status={resp.status_code}, url={url}"
-                    )
-                    return None
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in resp.aiter_bytes(chunk_size=65536):
-                    total += len(chunk)
-                    if total > _MAX_IMAGE_BYTES:
+    # Normalize Amazon image URL to high-resolution version
+    url = _normalize_amazon_image_url(url)
+
+    # Try downloading with different User-Agent strings (Amazon blocks some)
+    for attempt, ua in enumerate(_DOWNLOAD_USER_AGENTS):
+        headers = {
+            "User-Agent": ua,
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.amazon.com/",
+            "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+        }
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                async with client.stream("GET", url, headers=headers, timeout=30.0) as resp:
+                    if resp.status_code in (403, 429):
                         logger.warning(
-                            f"Image exceeds {_MAX_IMAGE_BYTES // (1024*1024)} MB limit, "
-                            f"aborting download: {url}"
+                            f"Image download blocked (status={resp.status_code}, "
+                            f"attempt {attempt + 1}/{len(_DOWNLOAD_USER_AGENTS)}): {url}"
+                        )
+                        continue  # try next User-Agent
+                    if resp.status_code != 200:
+                        logger.warning(
+                            f"Image download failed: status={resp.status_code}, url={url}"
                         )
                         return None
-                    chunks.append(chunk)
-                image_bytes = b"".join(chunks)
-                if len(image_bytes) < 1000:
-                    logger.warning(
-                        f"Image too small ({len(image_bytes)} bytes), skipping: {url}"
-                    )
-                    return None
-                return image_bytes
-    except Exception as e:
-        logger.error(f"Image download error for {url}: {e}")
-        return None
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        total += len(chunk)
+                        if total > _MAX_IMAGE_BYTES:
+                            logger.warning(
+                                f"Image exceeds {_MAX_IMAGE_BYTES // (1024*1024)} MB limit, "
+                                f"aborting download: {url}"
+                            )
+                            return None
+                        chunks.append(chunk)
+                    image_bytes = b"".join(chunks)
+                    if len(image_bytes) < 1000:
+                        logger.warning(
+                            f"Image too small ({len(image_bytes)} bytes), skipping: {url}"
+                        )
+                        return None
+                    return image_bytes
+        except Exception as e:
+            logger.warning(
+                f"Image download error (attempt {attempt + 1}/{len(_DOWNLOAD_USER_AGENTS)}): "
+                f"{url}: {e}"
+            )
+            continue  # try next User-Agent
+
+    logger.error(f"All {len(_DOWNLOAD_USER_AGENTS)} download attempts failed for: {url}")
+    return None
 
 
 # Minimum pixel size ML requires on at least one side (after removing white borders)
@@ -405,7 +466,7 @@ def _sanitize_attribute_value(attr_id: str, value: str) -> Optional[str]:
     Rules:
     - WEIGHT: If value is a bare number without unit, append " g" (ML requires unit).
       Examples: "200" → "200 g", "0.5" → "0.5 g", "200 g" → unchanged.
-    - GTIN: Validate EAN-13 / EAN-8 / UPC-A checksum. Return None to omit if invalid.
+    - GTIN: Validate EAN-13 / EAN-8 / UPC-A checksum. Send as-is even if invalid (some categories require GTIN present).
     - All others: return unchanged.
     """
     import re as _re
@@ -418,6 +479,18 @@ def _sanitize_attribute_value(attr_id: str, value: str) -> Optional[str]:
 
     if attr_id == "GTIN" and value:
         digits = _re.sub(r"\D", "", value)
+
+        # ── Defense: reject values with non-digit characters and too few digits ──
+        # If the original value contained letters (e.g. ASIN "B0D9KRNWGC") and
+        # the remaining digits are too few, the zero-padding would produce a fake
+        # GTIN (e.g. "09" → "00000009"). Reject early — caller will auto-inject
+        # EMPTY_GTIN_REASON via the _gtin_was_omitted path.
+        if digits != value.strip() and len(digits) < 8:
+            logger.warning(
+                f"GTIN '{value}' contains non-digit characters and only has "
+                f"{len(digits)} digit(s) — not a valid GTIN, omitting."
+            )
+            return None
 
         # ── Padding de ceros a la izquierda ──────────────────────────────────
         # Los formatos GTIN válidos son 8, 12, 13 o 14 dígitos.
@@ -445,8 +518,8 @@ def _sanitize_attribute_value(attr_id: str, value: str) -> Optional[str]:
                 )
 
         if len(digits) not in (8, 12, 13, 14):
-            logger.warning(f"GTIN '{value}' tiene longitud inválida ({len(digits)} dígitos) — se envía igual para que ML lo valide.")
-            return digits if digits else value
+            logger.warning(f"GTIN '{value}' tiene longitud inválida ({len(digits)} dígitos) — omitiendo para usar EMPTY_GTIN_REASON.")
+            return None
         # Validate Luhn-like checksum used by GS1 (EAN/UPC)
         total = 0
         for i, d in enumerate(reversed(digits[:-1])):
@@ -454,8 +527,11 @@ def _sanitize_attribute_value(attr_id: str, value: str) -> Optional[str]:
             total += n * (3 if i % 2 == 0 else 1)
         check = (10 - (total % 10)) % 10
         if check != int(digits[-1]):
-            logger.warning(f"GTIN '{digits}' tiene checksum inválido — se omite para evitar error 400 en ML.")
-            return None  # omitir atributo; ML rechaza GTINs con checksum incorrecto con error 400
+            logger.warning(
+                f"GTIN '{digits}' tiene checksum inválido (expected={check}, got={digits[-1]}) "
+                "— omitiendo para usar EMPTY_GTIN_REASON."
+            )
+            return None
         return digits
 
     return value
@@ -481,6 +557,7 @@ async def publish_item(
     sale_terms: Optional[List[Dict[str, Any]]] = None,
     shipping: Optional[Dict[str, Any]] = None,
     variations: Optional[List[Dict[str, Any]]] = None,
+    seller_custom_field: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Publish a new item on Mercado Libre.
@@ -775,6 +852,7 @@ async def publish_item(
             "sale_terms": sale_terms if sale_terms else None,
             "shipping": shipping if shipping else None,
             "variations": ml_variations if ml_variations else None,
+            "seller_custom_field": seller_custom_field,
         }
     else:
         item_data = {
@@ -791,6 +869,7 @@ async def publish_item(
             "sale_terms": sale_terms if sale_terms else None,
             "shipping": shipping if shipping else None,
             "variations": ml_variations if ml_variations else None,
+            "seller_custom_field": seller_custom_field,
         }
 
     # When variations are provided, ML derives price and available_quantity from them,
@@ -905,6 +984,20 @@ async def close_item(
     return await update_item(db, user_id, meli_item_id, {"status": "closed"})
 
 
+async def pause_item(
+    db: AsyncSession, user_id: int, meli_item_id: str
+) -> Optional[Dict[str, Any]]:
+    """Pause an ML listing (reversible, unlike close)."""
+    return await update_item(db, user_id, meli_item_id, {"status": "paused"})
+
+
+async def reactivate_item(
+    db: AsyncSession, user_id: int, meli_item_id: str
+) -> Optional[Dict[str, Any]]:
+    """Reactivate a paused ML listing."""
+    return await update_item(db, user_id, meli_item_id, {"status": "active"})
+
+
 async def update_price(
     db: AsyncSession, user_id: int, meli_item_id: str, new_price: float
 ) -> Optional[Dict[str, Any]]:
@@ -945,4 +1038,60 @@ async def get_user_info(
 ) -> Optional[Dict[str, Any]]:
     """Get the ML user info for the connected account."""
     return await _meli_request(db, user_id, "GET", "/users/me")
+
+
+async def search_seller_items_by_sku(
+    db: AsyncSession, user_id: int, sku: str
+) -> List[Dict[str, Any]]:
+    """
+    Search the seller's ML items by seller_custom_field (SKU).
+    Returns a list of item dicts with status != 'closed'.
+    Used to detect duplicates before publishing (items published manually on ML).
+    """
+    from app.models.meli_token import MeliToken
+
+    # Get meli_user_id from token
+    token = (await db.execute(
+        select(MeliToken).where(MeliToken.user_id == user_id)
+    )).scalar_one_or_none()
+    if not token or not token.meli_user_id:
+        logger.warning(f"No ML token/user_id for user {user_id}, skipping SKU search")
+        return []
+
+    # Search seller items by seller_custom_field (SKU).
+    # Don't filter by status here — we filter by status != "closed" when
+    # processing the response, so both active and paused items are detected.
+    result = await _meli_request(
+        db, user_id, "GET",
+        f"/users/{token.meli_user_id}/items/search",
+        params={"seller_sku": sku, "limit": "10"},
+    )
+
+    if not result or result.get("error"):
+        return []
+
+    item_ids = result.get("results", [])
+    if not item_ids:
+        return []
+
+    # Fetch item details in batch (ML supports multi-get with comma-separated IDs)
+    ids_str = ",".join(item_ids[:10])
+    items_response = await _meli_request(
+        db, user_id, "GET", "/items",
+        params={"ids": ids_str},
+    )
+
+    if not items_response:
+        return []
+
+    # Multi-get returns a list of {code, body} objects
+    items = []
+    response_list = items_response if isinstance(items_response, list) else []
+    for entry in response_list:
+        if isinstance(entry, dict) and entry.get("code") == 200:
+            body = entry.get("body", {})
+            if body.get("status") != "closed":
+                items.append(body)
+
+    return items
 

@@ -40,6 +40,7 @@ class ListingResponse(ListingBase):
     variation_asin: Optional[str] = None
     available_quantity: int = 15
     status: str
+    paused_by_stock: bool = False
     meli_permalink: Optional[str] = None
     created_at: datetime
     updated_at: datetime
@@ -71,3 +72,25 @@ class MeliPublishBulkResponse(BaseModel):
     total: int
     succeeded: int
     failed: int
+
+
+class StockPauseAction(BaseModel):
+    """Single action in a batch stock-pause/reactivate request."""
+    product_id: int
+    user_id: int
+    action: str = Field(..., pattern="^(pause|reactivate)$")
+
+
+class StockPauseDetail(BaseModel):
+    product_id: int
+    action: str
+    meli_item_id: Optional[str] = None
+    success: bool
+    error: Optional[str] = None
+
+
+class StockPauseBatchResponse(BaseModel):
+    paused: int = 0
+    reactivated: int = 0
+    errors: int = 0
+    details: List[StockPauseDetail] = []

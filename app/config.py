@@ -38,6 +38,19 @@ class Settings(BaseSettings):
     # --- Token encryption (Fernet) ---
     token_encryption_key: str = ""  # Fernet key for encrypting MeLi tokens at rest
 
+    # --- Claude AI (LLM auto-remediation) ---
+    anthropic_api_key: str = ""  # Set via ANTHROPIC_API_KEY env var
+    anthropic_model: str = "claude-sonnet-4-20250514"
+    llm_fix_enabled: bool = False  # Enable LLM fix discovery for unknown errors
+    llm_fix_min_confidence: float = 0.3  # Min LLM confidence to create a rule
+
+    # --- PR generation (Phase 3) ---
+    github_token: str = ""  # Personal access token for creating PRs
+    github_repo: str = "juliorr/dropshipping-meli-api"  # owner/repo
+    pr_promotion_min_successes: int = 10
+    pr_promotion_min_confidence: float = 0.85
+    pr_promotion_min_age_days: int = 7
+
     # --- Mercado Libre OAuth ---
     meli_client_id: str = ""
     meli_client_secret: str = ""
