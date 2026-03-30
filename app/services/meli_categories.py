@@ -56,17 +56,20 @@ async def get_category_children(category_id: str) -> List[MeliCategory]:
         if not children:
             return []
 
-        # Check catalog_listing status for all children concurrently
-        catalog_flags = await asyncio.gather(
-            *[is_catalog_only_category(cat["id"]) for cat in children]
+        # Check catalog-only AND classified-only status for all children concurrently
+        catalog_flags, classified_flags = await asyncio.gather(
+            asyncio.gather(*[is_catalog_only_category(cat["id"]) for cat in children]),
+            asyncio.gather(*[is_classified_only_category(cat["id"]) for cat in children]),
         )
 
         result = []
-        for cat, is_catalog in zip(children, catalog_flags):
-            if not is_catalog:
-                result.append(MeliCategory(id=cat["id"], name=cat["name"]))
-            else:
+        for cat, is_catalog, is_classified in zip(children, catalog_flags, classified_flags):
+            if is_classified:
+                logger.info(f"Filtered out classified-only child category: {cat['id']} ({cat['name']})")
+            elif is_catalog:
                 logger.info(f"Filtered out catalog-only child category: {cat['id']} ({cat['name']})")
+            else:
+                result.append(MeliCategory(id=cat["id"], name=cat["name"]))
 
         return result
 
@@ -107,17 +110,20 @@ async def search_categories_by_text(query: str, site_id: str = "MLM", limit: int
         if not candidates:
             return []
 
-        # Filter out catalog-only categories concurrently
-        catalog_flags = await asyncio.gather(
-            *[is_catalog_only_category(cat.id) for cat in candidates]
+        # Filter out catalog-only AND classified-only categories concurrently
+        catalog_flags, classified_flags = await asyncio.gather(
+            asyncio.gather(*[is_catalog_only_category(cat.id) for cat in candidates]),
+            asyncio.gather(*[is_classified_only_category(cat.id) for cat in candidates]),
         )
 
         result = []
-        for cat, is_catalog in zip(candidates, catalog_flags):
-            if not is_catalog:
-                result.append(cat)
-            else:
+        for cat, is_catalog, is_classified in zip(candidates, catalog_flags, classified_flags):
+            if is_classified:
+                logger.info(f"Filtered out classified-only category from search: {cat.id} ({cat.name})")
+            elif is_catalog:
                 logger.info(f"Filtered out catalog-only category from search: {cat.id} ({cat.name})")
+            else:
+                result.append(cat)
 
         return result
 
@@ -181,7 +187,9 @@ async def predict_category(title: str) -> Optional[str]:
     Translates the title to Spanish first so ML (which operates in Spanish) returns
     better predictions for English product titles scraped from Amazon.
     Returns the first predicted category ID that is NOT catalog-only.
-    Skips any catalog-only categories (catalog_listing=force).
+    If ALL predicted categories are catalog-only, returns the first one as a
+    last-resort fallback (the publish flow can still handle catalog categories
+    via family_name).
     """
     try:
         # Translate to Spanish before querying ML — improves prediction quality
@@ -208,20 +216,37 @@ async def predict_category(title: str) -> Optional[str]:
         if not candidate_ids:
             return None
 
-        # Check all candidates concurrently
-        catalog_flags = await asyncio.gather(
-            *[is_catalog_only_category(cat_id) for cat_id in candidate_ids]
+        # Check all candidates concurrently for both catalog-only and classified-only
+        catalog_flags, classified_flags = await asyncio.gather(
+            asyncio.gather(*[is_catalog_only_category(cat_id) for cat_id in candidate_ids]),
+            asyncio.gather(*[is_classified_only_category(cat_id) for cat_id in candidate_ids]),
         )
 
-        for cat_id, is_catalog in zip(candidate_ids, catalog_flags):
-            if not is_catalog:
-                logger.info(f"Predicted category (non-catalog): {cat_id}")
-                return cat_id
-            else:
+        for cat_id, is_catalog, is_classified in zip(candidate_ids, catalog_flags, classified_flags):
+            if is_classified:
+                logger.info(f"Skipping classified-only predicted category: {cat_id}")
+            elif is_catalog:
                 logger.info(f"Skipping catalog-only predicted category: {cat_id}")
+            else:
+                logger.info(f"Predicted category (publishable): {cat_id}")
+                return cat_id
 
-        logger.warning(f"All predicted categories for '{title[:50]}' are catalog-only")
-        return None
+        # All predicted categories are unpublishable — use first non-classified as fallback.
+        # Catalog-only categories can sometimes work with family_name, but classified-only
+        # categories are a hard block (no workaround).
+        for cat_id, is_classified in zip(candidate_ids, classified_flags):
+            if not is_classified:
+                logger.warning(
+                    f"All publishable categories exhausted for '{title[:50]}' — "
+                    f"returning catalog-only ({cat_id}) as fallback"
+                )
+                return cat_id
+
+        logger.warning(
+            f"All predicted categories for '{title[:50]}' are classified-only — "
+            f"returning first ({candidate_ids[0]}) as last-resort fallback"
+        )
+        return candidate_ids[0]
 
     except Exception as e:
         logger.error(f"Error predicting category: {e}")
@@ -402,6 +427,79 @@ async def is_catalog_only_category(category_id: str) -> bool:
 
     except Exception as e:
         logger.error(f"Error checking catalog-only for {category_id}: {e}")
+        return False
+
+
+async def is_classified_only_category(category_id: str) -> bool:
+    """
+    Check if a category only supports 'classified' listing mode (not 'buy_it_now').
+
+    Categories like Autos (MLM1744), Inmuebles, Servicios only allow classified ads
+    and reject normal product listings with error:
+      "Category MLM1744 only supports listing modes: [classified]."
+
+    Checks in order (fast to slow):
+
+    1. Redis cache (meli:categories:MLM) — settings.buying_modes list:
+       If 'buy_it_now' is NOT in the list → classified-only
+       If 'buy_it_now' IS in the list → not classified-only
+
+    2. MeLi API fallback (GET /categories/{id}):
+       Same logic with settings.buying_modes from the API response.
+    """
+    # ── Step 1: Try Redis cache first ──
+    cat_data = await _get_category_from_cache(category_id)
+    if cat_data:
+        settings_data = cat_data.get("settings", {})
+        buying_modes = settings_data.get("buying_modes")
+        if isinstance(buying_modes, list) and buying_modes:
+            if "buy_it_now" not in buying_modes:
+                logger.info(
+                    f"Category {category_id} [Redis] buying_modes={buying_modes} "
+                    f"→ is_classified_only=True"
+                )
+                return True
+            logger.info(
+                f"Category {category_id} [Redis] buying_modes={buying_modes} "
+                f"→ is_classified_only=False"
+            )
+            return False
+        # buying_modes absent or empty → need API check
+        logger.info(f"Category {category_id} [Redis] buying_modes absent — checking MeLi API...")
+    else:
+        logger.info(f"Category {category_id} not in Redis cache — checking MeLi API for buying_modes...")
+
+    # ── Step 2: MeLi API check ──
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{MELI_API_BASE}/categories/{category_id}",
+                timeout=10.0,
+            )
+
+        if resp.status_code != 200:
+            logger.warning(f"Could not fetch category {category_id}: {resp.status_code}")
+            return False
+
+        api_cat = resp.json()
+        api_settings = api_cat.get("settings", {})
+        buying_modes = api_settings.get("buying_modes", [])
+
+        if isinstance(buying_modes, list) and buying_modes and "buy_it_now" not in buying_modes:
+            logger.info(
+                f"Category {category_id} [API] buying_modes={buying_modes} "
+                f"→ is_classified_only=True"
+            )
+            return True
+
+        logger.info(
+            f"Category {category_id} [API] buying_modes={buying_modes} "
+            f"→ is_classified_only=False"
+        )
+        return False
+
+    except Exception as e:
+        logger.error(f"Error checking classified-only for {category_id}: {e}")
         return False
 
 

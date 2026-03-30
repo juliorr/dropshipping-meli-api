@@ -1,10 +1,12 @@
 """Listings router - CRUD endpoints for ML listing drafts."""
 
+import logging
 import math
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_current_user, get_db, verify_api_key
@@ -14,8 +16,13 @@ from app.schemas.listing import (
     ListingListResponse,
     ListingResponse,
     ListingUpdate,
+    StockPauseAction,
+    StockPauseBatchResponse,
+    StockPauseDetail,
 )
-from app.services.meli_categories import is_catalog_only_category
+from app.services.meli_categories import is_catalog_only_category, is_classified_only_category
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/listings", tags=["Listings"])
 
@@ -58,6 +65,18 @@ async def create_listing(
 ):
     """Create a new ML listing draft."""
     if data.meli_category_id:
+        if await is_classified_only_category(data.meli_category_id):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "classified_only_category",
+                    "message": (
+                        f"La categoría '{data.meli_category_id}' solo permite publicaciones "
+                        "de tipo 'clasificado' (ej: Autos, Inmuebles, Servicios) y no es "
+                        "compatible con ventas normales. Selecciona una categoría diferente."
+                    ),
+                },
+            )
         if await is_catalog_only_category(data.meli_category_id):
             raise HTTPException(
                 status_code=400,
@@ -70,6 +89,39 @@ async def create_listing(
                     ),
                 },
             )
+
+    # ── Duplicate prevention: reject if an active/paused listing already exists ──
+    if data.variation_asin:
+        active_query = select(MeliListing).where(
+            MeliListing.product_id == data.product_id,
+            MeliListing.user_id == current_user.id,
+            MeliListing.variation_asin == data.variation_asin,
+            MeliListing.meli_item_id.isnot(None),
+            MeliListing.status.in_(["active", "paused"]),
+        )
+    else:
+        active_query = select(MeliListing).where(
+            MeliListing.product_id == data.product_id,
+            MeliListing.user_id == current_user.id,
+            MeliListing.variation_asin.is_(None),
+            MeliListing.meli_item_id.isnot(None),
+            MeliListing.status.in_(["active", "paused"]),
+        )
+    active_listing = (await db.execute(active_query)).scalar_one_or_none()
+
+    if active_listing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "duplicate_listing",
+                "message": (
+                    "Este producto ya tiene una publicación activa en Mercado Libre. "
+                    "Cierra la publicación existente antes de crear una nueva."
+                ),
+                "existing_listing_id": active_listing.id,
+                "existing_meli_item_id": active_listing.meli_item_id,
+            },
+        )
 
     # Deduplicate draft by variation_asin scope
     if data.variation_asin:
@@ -112,10 +164,25 @@ async def create_listing(
         variation_asin=data.variation_asin,
         status="draft",
     )
-    db.add(listing)
-    await db.commit()
-    await db.refresh(listing)
-    return listing
+    try:
+        db.add(listing)
+        await db.commit()
+        await db.refresh(listing)
+        return listing
+    except IntegrityError as e:
+        await db.rollback()
+        if "uq_meli_listings_active_product_variation" in str(e):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "duplicate_listing",
+                    "message": (
+                        "Este producto ya tiene una publicación activa o un borrador en Mercado Libre. "
+                        "No se puede crear otro borrador para el mismo producto."
+                    ),
+                },
+            )
+        raise
 
 
 @router.get("/by-product/{product_id}", response_model=List[ListingResponse])
@@ -167,6 +234,18 @@ async def update_listing(
     update_data = data.model_dump(exclude_unset=True)
     new_category_id = update_data.get("meli_category_id")
     if new_category_id and new_category_id != listing.meli_category_id:
+        if await is_classified_only_category(new_category_id):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "classified_only_category",
+                    "message": (
+                        f"La categoría '{new_category_id}' solo permite publicaciones "
+                        "de tipo 'clasificado' (ej: Autos, Inmuebles, Servicios) y no es "
+                        "compatible con ventas normales. Selecciona una categoría diferente."
+                    ),
+                },
+            )
         if await is_catalog_only_category(new_category_id):
             raise HTTPException(
                 status_code=400,
@@ -188,13 +267,14 @@ async def update_listing(
     return listing
 
 
-@router.delete("/{listing_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{listing_id}")
 async def delete_listing(
     listing_id: int,
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete/close a listing."""
+    """Delete a listing draft. Returns product_id and remaining count so the
+    frontend can reset product status when no listings remain."""
     query = select(MeliListing).where(
         MeliListing.id == listing_id, MeliListing.user_id == current_user.id
     )
@@ -202,8 +282,23 @@ async def delete_listing(
     if listing is None:
         raise HTTPException(status_code=404, detail="Listing not found")
 
+    product_id = listing.product_id
+
+    remaining_q = select(func.count()).where(
+        MeliListing.product_id == product_id,
+        MeliListing.user_id == current_user.id,
+        MeliListing.id != listing_id,
+    )
+    remaining = (await db.execute(remaining_q)).scalar() or 0
+
     await db.delete(listing)
     await db.commit()
+
+    return {
+        "message": "Listing deleted",
+        "product_id": product_id,
+        "remaining_listings": remaining,
+    }
 
 
 @router.get("/stats")
@@ -272,5 +367,100 @@ async def get_listings_by_product_ids(
             "meli_status": listing.status,
             "meli_item_id": listing.meli_item_id,
             "variation_asin": listing.variation_asin,
+            "paused_by_stock": listing.paused_by_stock,
         })
     return out
+
+
+@router.post("/stock-pause/batch", response_model=StockPauseBatchResponse)
+async def batch_stock_pause(
+    actions: List[StockPauseAction] = Body(...),
+    _: str = Depends(verify_api_key),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Internal endpoint (API key protected) — batch pause/reactivate ML listings
+    based on Amazon stock availability changes.
+
+    Called by backend-api's check_prices Celery task when products go out of
+    stock on Amazon (pause) or come back in stock (reactivate).
+    """
+    from app.services.meli_client import pause_item, reactivate_item
+
+    paused = 0
+    reactivated = 0
+    errors = 0
+    details: List[StockPauseDetail] = []
+
+    for act in actions:
+        # Find listings for this product+user that can be acted on
+        expected_status = "active" if act.action == "pause" else "paused"
+        result = await db.execute(
+            select(MeliListing).where(
+                MeliListing.product_id == act.product_id,
+                MeliListing.user_id == act.user_id,
+                MeliListing.status == expected_status,
+                MeliListing.meli_item_id.isnot(None),
+            )
+        )
+        listings = result.scalars().all()
+
+        if not listings:
+            details.append(StockPauseDetail(
+                product_id=act.product_id,
+                action=act.action,
+                success=True,
+                error="no matching listings",
+            ))
+            continue
+
+        for listing in listings:
+            try:
+                if act.action == "pause":
+                    ml_result = await pause_item(db, act.user_id, listing.meli_item_id)
+                else:
+                    ml_result = await reactivate_item(db, act.user_id, listing.meli_item_id)
+
+                if ml_result and not ml_result.get("error"):
+                    if act.action == "pause":
+                        listing.status = "paused"
+                        listing.paused_by_stock = True
+                        paused += 1
+                    else:
+                        listing.status = "active"
+                        listing.paused_by_stock = False
+                        reactivated += 1
+                    details.append(StockPauseDetail(
+                        product_id=act.product_id,
+                        action=act.action,
+                        meli_item_id=listing.meli_item_id,
+                        success=True,
+                    ))
+                else:
+                    errors += 1
+                    error_msg = ml_result.get("message", "ML API error") if ml_result else "No response"
+                    details.append(StockPauseDetail(
+                        product_id=act.product_id,
+                        action=act.action,
+                        meli_item_id=listing.meli_item_id,
+                        success=False,
+                        error=error_msg,
+                    ))
+            except Exception as e:
+                errors += 1
+                logger.error(
+                    f"[stock-pause] Failed to {act.action} listing "
+                    f"{listing.meli_item_id} for product {act.product_id}: {e}"
+                )
+                details.append(StockPauseDetail(
+                    product_id=act.product_id,
+                    action=act.action,
+                    meli_item_id=listing.meli_item_id,
+                    success=False,
+                    error=str(e),
+                ))
+
+    await db.commit()
+    return StockPauseBatchResponse(
+        paused=paused, reactivated=reactivated, errors=errors, details=details
+    )

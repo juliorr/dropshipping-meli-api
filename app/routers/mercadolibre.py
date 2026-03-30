@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.dependencies import get_current_user, get_db
@@ -23,8 +23,8 @@ from app.schemas.meli import (
 )
 from app.schemas.listing import ListingVariantResult, MeliPublishBulkResponse
 from app.services.meli_auth import exchange_code_for_tokens, get_auth_url
-from app.services.meli_categories import get_categories_cache_status, get_category_attributes, get_category_children, get_category_siblings, get_or_fetch_category, get_parent_category, get_site_categories, predict_category, search_catalog_product, search_categories_by_text, search_categories_in_cache, sync_categories_to_cache, translate_to_spanish
-from app.services.meli_client import close_item, get_user_info, publish_item, publish_item_catalog, update_item, update_stock, upload_pictures_to_meli
+from app.services.meli_categories import get_categories_cache_status, get_category_attributes, get_category_children, get_category_siblings, get_or_fetch_category, get_parent_category, get_site_categories, is_classified_only_category, predict_category, search_catalog_product, search_categories_by_text, search_categories_in_cache, sync_categories_to_cache, translate_to_spanish
+from app.services.meli_client import _meli_request, close_item, get_user_info, publish_item, publish_item_catalog, search_seller_items_by_sku, update_item, update_stock, upload_pictures_to_meli
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,28 @@ def _is_family_name_required_error(error_data: dict) -> bool:
         code = cause.get("code", "")
         msg = cause.get("message", "").lower()
         if code == "body.required_fields" and "family_name" in msg:
+            return True
+    return False
+
+
+def _is_classified_only_error(error_data: dict) -> bool:
+    """
+    Detect if ML rejected the publication because the category only supports
+    classified listing mode (not buy_it_now).
+
+    ML returns:
+      error: "item.buying_mode.invalid"
+      message: "Category MLM1744 only supports listing modes: [classified]."
+    """
+    if error_data.get("error") == "item.buying_mode.invalid":
+        return True
+    # Also check message text as fallback
+    top_msg = str(error_data.get("message", "")).lower()
+    if "listing modes" in top_msg and "classified" in top_msg:
+        return True
+    for cause in error_data.get("cause", []):
+        msg = cause.get("message", "").lower()
+        if "listing modes" in msg and "classified" in msg:
             return True
     return False
 
@@ -411,15 +433,102 @@ async def publish_listing_to_meli(
     if listing.meli_item_id:
         raise HTTPException(status_code=400, detail="Listing already published on ML")
 
+    # ── Duplicate prevention: check for sibling active/paused listings ──
+    sibling_query = select(MeliListing).where(
+        MeliListing.product_id == listing.product_id,
+        MeliListing.user_id == current_user.id,
+        MeliListing.id != listing.id,
+        MeliListing.meli_item_id.isnot(None),
+        MeliListing.status.in_(["active", "paused"]),
+    )
+    if listing.variation_asin:
+        sibling_query = sibling_query.where(MeliListing.variation_asin == listing.variation_asin)
+    else:
+        sibling_query = sibling_query.where(MeliListing.variation_asin.is_(None))
+
+    existing_sibling = (await db.execute(sibling_query)).scalar_one_or_none()
+    if existing_sibling:
+        # Clean up the orphan draft
+        await db.delete(listing)
+        await db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "duplicate_listing",
+                "message": (
+                    f"Este producto ya tiene una publicación activa en Mercado Libre "
+                    f"(ML ID: {existing_sibling.meli_item_id}). "
+                    "Cierra la publicación existente antes de publicar una nueva."
+                ),
+                "existing_listing_id": existing_sibling.id,
+                "existing_meli_item_id": existing_sibling.meli_item_id,
+            },
+        )
+
     if not listing.meli_category_id:
         raise HTTPException(status_code=400, detail="Listing must have a ML category set before publishing")
+
+    from app.services.remediation_engine import log_publish_error
 
     # ──────────────────────────────────────────────────────────────────────
     # PRE-VALIDACIÓN DE CATEGORÍA: Verificar ANTES de subir imágenes o
     # hacer cualquier operación costosa si la categoría es compatible con
-    # publicaciones normales (no-catálogo). Esto evita crear drafts y
-    # subir imágenes innecesariamente cuando la categoría va a fallar.
+    # publicaciones normales (no-catálogo / no-clasificado). Esto evita
+    # crear drafts y subir imágenes innecesariamente cuando la categoría
+    # va a fallar.
     # ──────────────────────────────────────────────────────────────────────
+
+    # Check classified-only FIRST (harder block — no workaround via family_name)
+    is_classified = await is_classified_only_category(listing.meli_category_id)
+    if is_classified:
+        logger.warning(
+            f"[PRE-VALIDATION] Category {listing.meli_category_id} is classified-only. "
+            f"Rejecting before image upload. Listing {listing.id} will be cleaned up."
+        )
+        try:
+            await db.rollback()
+            await db.delete(listing)
+            await db.commit()
+        except Exception as cleanup_err:
+            logger.error(f"Failed to clean up draft listing {listing.id}: {cleanup_err}")
+            await db.rollback()
+
+        sibling_categories = []
+        parent = None
+        current_id = listing.meli_category_id
+        for _ in range(3):
+            parent = await get_parent_category(current_id)
+            if not parent:
+                break
+            siblings = await get_category_children(parent["id"])
+            candidates = [
+                {"id": s.id, "name": s.name}
+                for s in siblings
+                if s.id != listing.meli_category_id
+            ]
+            if candidates:
+                sibling_categories = candidates
+                break
+            current_id = parent["id"]
+
+        await log_publish_error(
+            db=db, user_id=current_user.id, listing_id=listing.id,
+            product_id=listing.product_id, meli_category_id=listing.meli_category_id,
+            error_code="classified_only_category",
+            error_message=f"Category {listing.meli_category_id} only supports classified listing mode",
+        )
+        raise HTTPException(status_code=400, detail={
+            "code": "classified_only_category",
+            "message": (
+                f"La categoría '{listing.meli_category_id}' solo permite publicaciones de tipo "
+                "'clasificado' (ej: Autos, Inmuebles, Servicios) y no es compatible con ventas "
+                "normales de productos. Selecciona una categoría alternativa para tu producto."
+            ),
+            "parent_category_id": parent["id"] if parent else None,
+            "parent_category_name": parent["name"] if parent else None,
+            "alternative_categories": sibling_categories,
+        })
+
     from app.services.meli_categories import is_catalog_only_category as _is_cat_only
     is_catalog_only = await _is_cat_only(listing.meli_category_id)
     if is_catalog_only and not data.family_name:
@@ -455,6 +564,13 @@ async def publish_listing_to_meli(
                 break
             current_id = parent["id"]
 
+        # Log pre-validation error for remediation dashboard
+        await log_publish_error(
+            db=db, user_id=current_user.id, listing_id=listing.id,
+            product_id=listing.product_id, meli_category_id=listing.meli_category_id,
+            error_code="catalog_required_category",
+            error_message=f"Category {listing.meli_category_id} requires catalog mode or family_name",
+        )
         raise HTTPException(status_code=400, detail={
             "code": "catalog_required_category",
             "message": (
@@ -476,6 +592,12 @@ async def publish_listing_to_meli(
     # ──────────────────────────────────────────────────────────────────────
     children = await get_category_children(listing.meli_category_id)
     if children:
+        await log_publish_error(
+            db=db, user_id=current_user.id, listing_id=listing.id,
+            product_id=listing.product_id, meli_category_id=listing.meli_category_id,
+            error_code="non_leaf_category",
+            error_message=f"Category {listing.meli_category_id} is not a leaf category",
+        )
         raise HTTPException(status_code=400, detail={
             "code": "non_leaf_category",
             "message": (
@@ -484,6 +606,42 @@ async def publish_listing_to_meli(
             ),
             "children": [{"id": c.id, "name": c.name} for c in children],
         })
+
+    # ── Pre-publish ML check: detect items already published on ML by SKU (ASIN) ──
+    product_asin = data.product_asin or listing.variation_asin
+    if product_asin:
+        try:
+            existing_ml_items = await search_seller_items_by_sku(db, current_user.id, product_asin)
+            active_ml_items = [
+                i for i in existing_ml_items
+                if i.get("status") in ("active", "paused")
+            ]
+            if active_ml_items:
+                permalinks = [i.get("permalink") for i in active_ml_items if i.get("permalink")]
+                await log_publish_error(
+                    db=db, user_id=current_user.id, listing_id=listing.id,
+                    product_id=listing.product_id, meli_category_id=listing.meli_category_id,
+                    error_code="duplicate_ml_listing",
+                    error_message=f"Product already published on ML: {active_ml_items[0].get('id')}",
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "duplicate_ml_listing",
+                        "message": (
+                            f"Ya existe una publicación en Mercado Libre con este producto "
+                            f"(ML ID: {active_ml_items[0].get('id', 'unknown')}). "
+                            "Ciérrala primero o usa la publicación existente."
+                        ),
+                        "existing_meli_item_ids": [i.get("id") for i in active_ml_items],
+                        "existing_permalinks": permalinks,
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Don't block publishing if ML search fails — log and continue
+            logger.warning(f"Pre-publish ML SKU check failed for ASIN {product_asin}: {e}")
 
     # Get product images from local filesystem
     product_id = data.product_id or listing.product_id
@@ -525,12 +683,20 @@ async def publish_listing_to_meli(
     has_gtin = any(a.get("id") == "GTIN" for a in extra_attributes)
     has_empty_gtin_reason = any(a.get("id") == "EMPTY_GTIN_REASON" for a in extra_attributes)
     if not has_gtin and not has_empty_gtin_reason and data.product_asin:
-        logger.info(
-            f"[GTIN] Auto-injecting GTIN with ASIN '{data.product_asin}' "
-            f"for listing {listing.id} (category {listing.meli_category_id}) — "
-            "frontend did not send GTIN explicitly"
-        )
-        extra_attributes.append({"id": "GTIN", "value_name": data.product_asin})
+        asin_digits = data.product_asin.strip()
+        if asin_digits.isdigit() and len(asin_digits) in (8, 12, 13, 14):
+            logger.info(
+                f"[GTIN] Auto-injecting GTIN with ASIN '{asin_digits}' "
+                f"for listing {listing.id} (category {listing.meli_category_id}) — "
+                "frontend did not send GTIN explicitly"
+            )
+            extra_attributes.append({"id": "GTIN", "value_name": asin_digits})
+        else:
+            logger.info(
+                f"[GTIN] ASIN '{data.product_asin}' is not a valid GTIN — "
+                f"using EMPTY_GTIN_REASON for listing {listing.id}"
+            )
+            extra_attributes.append({"id": "EMPTY_GTIN_REASON", "value_name": "El producto no tiene código registrado"})
     elif has_gtin:
         # El frontend envió GTIN — verificar si tiene valor real o está vacío
         gtin_attr = next((a for a in extra_attributes if a.get("id") == "GTIN"), None)
@@ -601,7 +767,10 @@ async def publish_listing_to_meli(
             for v in data.variations
         ]
 
-    result = await publish_item(
+    # Use ASIN as seller_custom_field (SKU) for duplicate detection on ML side
+    seller_sku = data.product_asin or listing.variation_asin
+
+    publish_kwargs = dict(
         db=db,
         user_id=current_user.id,
         title=listing.title,
@@ -619,10 +788,32 @@ async def publish_listing_to_meli(
         sale_terms=sale_terms,
         shipping=shipping,
         variations=variations_payload,
+        seller_custom_field=seller_sku,
     )
+    result = await publish_item(**publish_kwargs)
 
     if result is None:
         raise HTTPException(status_code=500, detail="No response from ML API")
+
+    if result.get("error"):
+        # --- AUTO-REMEDIATION: try known fixes before returning error ---
+        try:
+            from app.services.remediation_engine import attempt_remediation
+
+            remediation_result = await attempt_remediation(
+                db=db,
+                user_id=current_user.id,
+                listing_id=listing.id,
+                product_id=listing.product_id,
+                meli_category_id=listing.meli_category_id,
+                original_result=result,
+                publish_kwargs=publish_kwargs,
+                request_data=data.model_dump(exclude={"images"}),
+            )
+            if remediation_result is not None and not remediation_result.get("error"):
+                result = remediation_result  # Fix worked — use remediated result
+        except Exception as remediation_err:
+            logger.warning(f"[REMEDIATION] Engine error (non-blocking): {remediation_err}")
 
     if result.get("error"):
         # Normal publish failed — parse ML error response to give better feedback
@@ -635,6 +826,52 @@ async def publish_listing_to_meli(
             # requires catalog mode. We do NOT fall back to catalog — instead we clean up
             # and suggest alternative categories.
             if isinstance(error_data, dict):
+                # ----------------------------------------------------------------
+                # Detectar categoría classified-only (safety net):
+                # Si la pre-validación no lo atrapó, ML rechaza con
+                # "Category X only supports listing modes: [classified]."
+                # ----------------------------------------------------------------
+                if _is_classified_only_error(error_data):
+                    logger.warning(
+                        f"[CLASSIFIED-ONLY] Category {listing.meli_category_id} "
+                        "only supports classified mode. Cleaning up draft listing."
+                    )
+                    try:
+                        await db.delete(listing)
+                        await db.commit()
+                    except Exception as cleanup_err:
+                        logger.error(f"Failed to clean up draft listing {listing.id} (classified): {cleanup_err}")
+
+                    sibling_categories = []
+                    parent = None
+                    current_id = listing.meli_category_id
+                    for _ in range(3):
+                        parent = await get_parent_category(current_id)
+                        if not parent:
+                            break
+                        siblings = await get_category_children(parent["id"])
+                        candidates = [
+                            {"id": s.id, "name": s.name}
+                            for s in siblings
+                            if s.id != listing.meli_category_id
+                        ]
+                        if candidates:
+                            sibling_categories = candidates
+                            break
+                        current_id = parent["id"]
+
+                    raise HTTPException(status_code=400, detail={
+                        "code": "classified_only_category",
+                        "message": (
+                            f"La categoría '{listing.meli_category_id}' solo permite publicaciones "
+                            "de tipo 'clasificado' (ej: Autos, Inmuebles, Servicios) y no es compatible "
+                            "con ventas normales de productos. Selecciona una categoría alternativa."
+                        ),
+                        "parent_category_id": parent["id"] if parent else None,
+                        "parent_category_name": parent["name"] if parent else None,
+                        "alternative_categories": sibling_categories,
+                    })
+
                 # ----------------------------------------------------------------
                 # Detectar categoría demasiado genérica (family_name required):
                 # ML exige family_name en categorías tipo "Otros" porque las trata
@@ -1050,11 +1287,24 @@ async def close_listing_on_meli(
     if listing is None:
         raise HTTPException(status_code=404, detail="Listing not found")
 
+    product_id = listing.product_id
+
     if not listing.meli_item_id:
         # No ML item — just delete the local listing
+        remaining_q = select(func.count()).where(
+            MeliListing.product_id == product_id,
+            MeliListing.user_id == current_user.id,
+            MeliListing.id != listing_id,
+        )
+        remaining = (await db.execute(remaining_q)).scalar() or 0
         await db.delete(listing)
         await db.commit()
-        return {"message": "Listing draft deleted", "product_status": "scraped"}
+        return {
+            "message": "Listing draft deleted",
+            "product_status": "scraped",
+            "product_id": product_id,
+            "remaining_listings": remaining,
+        }
 
     # Close the item on ML
     result = await close_item(
@@ -1063,19 +1313,58 @@ async def close_listing_on_meli(
         meli_item_id=listing.meli_item_id,
     )
 
+    ml_close_failed = False
     if result is None or result.get("error"):
-        detail = result.get("detail", "Unknown error") if result else "No response from ML"
-        raise HTTPException(status_code=500, detail=f"ML close failed: {detail}")
+        _NON_CRITICAL_CAUSE_CODES = {
+            "item.status.not_modifiable",  # e.g. under_review
+            "item.invalid_status",          # e.g. already closed
+        }
+        causes = result.get("cause", []) if result else []
+        is_status_error = (
+            result is not None
+            and result.get("status") == 400
+            and any(c.get("code") in _NON_CRITICAL_CAUSE_CODES for c in causes)
+        )
+
+        if not is_status_error:
+            detail = result.get("detail", "Unknown error") if result else "No response from ML"
+            raise HTTPException(status_code=500, detail=f"ML close failed: {detail}")
+
+        logger.warning(
+            f"ML refused to close {listing.meli_item_id} "
+            f"(causes: {[c.get('code') for c in causes]}), "
+            f"deleting local listing {listing_id} anyway."
+        )
+        ml_close_failed = True
+
+    # Count remaining listings for this product before deleting
+    remaining_q = select(func.count()).where(
+        MeliListing.product_id == product_id,
+        MeliListing.user_id == current_user.id,
+        MeliListing.id != listing_id,
+    )
+    remaining = (await db.execute(remaining_q)).scalar() or 0
 
     # Remove the local listing
     await db.delete(listing)
     await db.commit()
 
-    return {
-        "message": "Publicación cerrada y eliminada de Mercado Libre",
+    response = {
         "meli_item_id": listing.meli_item_id,
         "product_status": "scraped",
+        "product_id": product_id,
+        "remaining_listings": remaining,
     }
+    if ml_close_failed:
+        response["message"] = "Publicación eliminada localmente (no se pudo cerrar en ML)"
+        response["warning"] = (
+            "El ítem en ML no se pudo cerrar porque su estado no lo permite. "
+            "Será manejado por ML automáticamente."
+        )
+    else:
+        response["message"] = "Publicación cerrada y eliminada de Mercado Libre"
+
+    return response
 
 
 @router.get("/catalog/search")
@@ -1148,6 +1437,17 @@ async def publish_catalog_listing_to_meli(
 
     if result.get("error"):
         detail_text = result.get("detail", "Unknown error")
+        # Log catalog publish error for remediation dashboard
+        try:
+            from app.services.remediation_engine import log_publish_error
+            await log_publish_error(
+                db=db, user_id=current_user.id, listing_id=listing.id,
+                product_id=listing.product_id, meli_category_id=listing.meli_category_id,
+                error_code="catalog_publish_failed",
+                error_message=str(detail_text)[:500],
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail=f"ML catalog publish failed: {detail_text}")
 
     # Update listing with ML data
@@ -1238,6 +1538,10 @@ def _friendly_error(exc: Exception) -> str:
         return "Esta variante ya está publicada en Mercado Libre."
     if "ConnectionRefused" in msg or "connect" in msg.lower():
         return "No se pudo conectar a Mercado Libre. Verifica tu conexión."
+    if "listing modes" in msg.lower() and "classified" in msg.lower():
+        return "Esta categoría solo permite anuncios clasificados (ej: Autos, Inmuebles). Selecciona otra categoría."
+    if "buying_mode.invalid" in msg.lower():
+        return "El modo de compra no es compatible con esta categoría. Selecciona otra categoría."
     if "family_name" in msg.lower():
         return "Esta categoría requiere un 'Nombre de familia'. Completa ese campo en el formulario."
     if "required_fields" in msg.lower() or "required" in msg.lower():
@@ -1250,9 +1554,10 @@ def _friendly_error(exc: Exception) -> str:
     return msg[:200] if len(msg) <= 200 else msg[:200] + "…"
 
 
-def _get_dimension_display(attributes: dict, display_labels: dict, asin: str) -> str:
+def _get_dimension_display(attributes: dict, display_labels: dict) -> str:
     """Return a short human-readable label for this variant (used in ML title suffix).
     Returns the attribute VALUE (e.g. 'Cacao Nib Crunch'), not the label ('Flavor').
+    Returns empty string when no meaningful attribute is found.
     """
     priority = ["flavor_name", "scent_name", "color_name", "size_name", "style_name"]
     for key in priority:
@@ -1261,8 +1566,9 @@ def _get_dimension_display(attributes: dict, display_labels: dict, asin: str) ->
     # Use first available attribute value
     if attributes:
         first_key = next(iter(attributes))
-        return attributes[first_key] or asin
-    return asin
+        if attributes[first_key]:
+            return attributes[first_key]
+    return ""
 
 
 @router.post("/publish-variants", response_model=MeliPublishBulkResponse)
@@ -1289,12 +1595,81 @@ async def publish_variants_to_meli(
     if base_listing is None:
         raise HTTPException(status_code=404, detail="Base listing not found")
 
+    # ── PRE-VALIDATION: classified-only and catalog-only categories ──
+    # publish-variants was missing these checks entirely, causing 400 errors from ML.
+    from app.services.meli_categories import is_catalog_only_category as _is_cat_only
+
+    is_classified = await is_classified_only_category(base_listing.meli_category_id)
+    if is_classified:
+        sibling_categories = []
+        parent = None
+        current_id = base_listing.meli_category_id
+        for _ in range(3):
+            parent = await get_parent_category(current_id)
+            if not parent:
+                break
+            siblings = await get_category_children(parent["id"])
+            candidates = [
+                {"id": s.id, "name": s.name}
+                for s in siblings
+                if s.id != base_listing.meli_category_id
+            ]
+            if candidates:
+                sibling_categories = candidates
+                break
+            current_id = parent["id"]
+
+        raise HTTPException(status_code=400, detail={
+            "code": "classified_only_category",
+            "message": (
+                f"La categoría '{base_listing.meli_category_id}' solo permite publicaciones de tipo "
+                "'clasificado' (ej: Autos, Inmuebles, Servicios) y no es compatible con ventas "
+                "normales de productos. Selecciona una categoría alternativa."
+            ),
+            "parent_category_id": parent["id"] if parent else None,
+            "parent_category_name": parent["name"] if parent else None,
+            "alternative_categories": sibling_categories,
+        })
+
+    is_catalog = await _is_cat_only(base_listing.meli_category_id)
+    if is_catalog and not data.family_name:
+        sibling_categories = []
+        parent = None
+        current_id = base_listing.meli_category_id
+        for _ in range(3):
+            parent = await get_parent_category(current_id)
+            if not parent:
+                break
+            siblings = await get_category_children(parent["id"])
+            candidates = [
+                {"id": s.id, "name": s.name}
+                for s in siblings
+                if s.id != base_listing.meli_category_id
+            ]
+            if candidates:
+                sibling_categories = candidates
+                break
+            current_id = parent["id"]
+
+        raise HTTPException(status_code=400, detail={
+            "code": "catalog_required_category",
+            "message": (
+                f"La categoría '{base_listing.meli_category_id}' requiere modo catálogo o family_name "
+                "y no es compatible con publicaciones normales. "
+                "Selecciona una categoría alternativa o ingresa un 'Family Name'."
+            ),
+            "parent_category_id": parent["id"] if parent else None,
+            "parent_category_name": parent["name"] if parent else None,
+            "alternative_categories": sibling_categories,
+        })
+
     # Get product images from local filesystem for fallback
     product_id = data.product_id or base_listing.product_id
     fallback_pictures = get_image_paths(product_id) if product_id else []
 
     base_title = base_listing.title
     brand = data.brand or data.product_brand or None
+    model = data.model or (data.product_title[:60] if data.product_title else base_listing.title[:60])
 
     # Build sale_terms
     sale_terms = None
@@ -1333,7 +1708,11 @@ async def publish_variants_to_meli(
     has_gtin = any(a.get("id") == "GTIN" for a in extra_attributes)
     has_empty_gtin_reason = any(a.get("id") == "EMPTY_GTIN_REASON" for a in extra_attributes)
     if not has_gtin and not has_empty_gtin_reason and data.product_asin:
-        extra_attributes.append({"id": "GTIN", "value_name": data.product_asin})
+        asin_digits = data.product_asin.strip()
+        if asin_digits.isdigit() and len(asin_digits) in (8, 12, 13, 14):
+            extra_attributes.append({"id": "GTIN", "value_name": asin_digits})
+        else:
+            extra_attributes.append({"id": "EMPTY_GTIN_REASON", "value_name": "El producto no tiene código registrado"})
     elif has_gtin:
         gtin_attr = next((a for a in extra_attributes if a.get("id") == "GTIN"), None)
         if not (gtin_attr or {}).get("value_name", "").strip():
@@ -1343,24 +1722,56 @@ async def publish_variants_to_meli(
     if not extra_attributes:
         extra_attributes = None
 
+    # ── Pre-publish ML check: detect items already published on ML by SKU (ASIN) ──
+    if data.product_asin:
+        try:
+            existing_ml_items = await search_seller_items_by_sku(db, current_user.id, data.product_asin)
+            active_ml_items = [
+                i for i in existing_ml_items
+                if i.get("status") in ("active", "paused")
+            ]
+            if active_ml_items:
+                permalinks = [i.get("permalink") for i in active_ml_items if i.get("permalink")]
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "duplicate_ml_listing",
+                        "message": (
+                            f"Ya existe una publicación en Mercado Libre con este producto "
+                            f"(ML ID: {active_ml_items[0].get('id', 'unknown')}). "
+                            "Ciérrala primero o usa la publicación existente."
+                        ),
+                        "existing_meli_item_ids": [i.get("id") for i in active_ml_items],
+                        "existing_permalinks": permalinks,
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Pre-publish ML SKU check failed for ASIN {data.product_asin}: {e}")
+
     results: list[ListingVariantResult] = []
 
     for variation in data.variations:
         variation_asin = variation.asin
         user_error: str | None = None
-        dim_label: str = variation_asin  # fallback until computed
+        dim_label: str = ""
         try:
             # Build variant title: "Dim Label - Base Title" truncated to 60 chars (ML limit).
             # Variant name goes FIRST so it's always visible even when base is long.
-            dim_label = _get_dimension_display(variation.attributes, variation.display_labels, variation_asin)
+            # When no dimension attribute exists, just use the base title (no prefix).
+            dim_label = _get_dimension_display(variation.attributes, variation.display_labels)
             ML_TITLE_LIMIT = 60
-            separator = " - "
-            # If dim_label alone exceeds the limit, truncate it
-            dim_label_safe = dim_label[:ML_TITLE_LIMIT - len(separator) - 5].rstrip() if len(dim_label) > ML_TITLE_LIMIT - len(separator) - 5 else dim_label
-            prefix = f"{dim_label_safe}{separator}"
-            remaining = ML_TITLE_LIMIT - len(prefix)
-            truncated_base = base_title[:remaining].rstrip() if remaining > 0 else ""
-            variant_title = f"{prefix}{truncated_base}"
+            if dim_label:
+                separator = " - "
+                # If dim_label alone exceeds the limit, truncate it
+                dim_label_safe = dim_label[:ML_TITLE_LIMIT - len(separator) - 5].rstrip() if len(dim_label) > ML_TITLE_LIMIT - len(separator) - 5 else dim_label
+                prefix = f"{dim_label_safe}{separator}"
+                remaining = ML_TITLE_LIMIT - len(prefix)
+                truncated_base = base_title[:remaining].rstrip() if remaining > 0 else ""
+                variant_title = f"{prefix}{truncated_base}"
+            else:
+                variant_title = base_title[:ML_TITLE_LIMIT].rstrip()
 
             # Use a savepoint so a failure here doesn't kill the whole session
             async with db.begin_nested():
@@ -1398,6 +1809,24 @@ async def publish_variants_to_meli(
                     )
                     db.add(variant_listing)
 
+            # ── Duplicate prevention: check if variation already published ──
+            already_published = (await db.execute(
+                select(MeliListing).where(
+                    MeliListing.product_id == base_listing.product_id,
+                    MeliListing.user_id == current_user.id,
+                    MeliListing.variation_asin == variation_asin,
+                    MeliListing.meli_item_id.isnot(None),
+                    MeliListing.status.in_(["active", "paused"]),
+                )
+            )).scalar_one_or_none()
+
+            if already_published:
+                user_error = (
+                    f"Esta variante ({dim_label or variation_asin}) ya está publicada en ML "
+                    f"(ID: {already_published.meli_item_id})"
+                )
+                raise ValueError(user_error)
+
             # 2. Gather images: variant-specific first, fallback to product images on filesystem
             pictures = variation.images[:10] if variation.images else []
             if not pictures:
@@ -1414,9 +1843,12 @@ async def publish_variants_to_meli(
             variant_family_name: Optional[str] = None
             if data.family_name:
                 base_fn = data.family_name.strip()
-                candidate_fn = f"{dim_label} - {base_fn}"
-                # ML family_name limit: 60 chars (same as title)
-                variant_family_name = candidate_fn[:60]
+                if dim_label:
+                    candidate_fn = f"{dim_label} - {base_fn}"
+                    variant_family_name = candidate_fn[:60]
+                else:
+                    # No dimension label — use base family_name as-is
+                    variant_family_name = base_fn[:60]
 
             # Merge base category attributes with per-variant ML attributes.
             # Per-variant attrs (COLOR, SIZE, FLAVOR…) override any matching base attr.
@@ -1435,7 +1867,7 @@ async def publish_variants_to_meli(
                     base_map[ml_attr.id] = override
                 merged_attributes = list(base_map.values()) or None
 
-            result = await publish_item(
+            publish_kwargs = dict(
                 db=db,
                 user_id=current_user.id,
                 title=variant_listing.title,
@@ -1447,16 +1879,54 @@ async def publish_variants_to_meli(
                 description=variant_listing.description or "",
                 pictures=pictures,
                 brand=brand,
-                model=variant_title,
+                model=model,
                 extra_attributes=merged_attributes,
                 family_name=variant_family_name,
                 sale_terms=sale_terms,
                 shipping=shipping,
                 variations=None,
+                seller_custom_field=variation_asin,
             )
+            result = await publish_item(**publish_kwargs)
+
+            # Retry with local filesystem images if remote URL download failed
+            if (
+                result
+                and result.get("error")
+                and "image_upload_failed" in str(result.get("detail", ""))
+                and fallback_pictures
+                and pictures is not fallback_pictures
+            ):
+                logger.warning(
+                    f"Image upload failed for variant {variation_asin} with remote URLs, "
+                    f"retrying with {len(fallback_pictures)} local filesystem images..."
+                )
+                publish_kwargs["pictures"] = fallback_pictures
+                result = await publish_item(**publish_kwargs)
 
             if result is None or result.get("error"):
                 raw = (result or {})
+                # Extract specific ML error code from causes (ML returns error=True,
+                # so we need to dig into cause[].code for the real error code)
+                cause_list = raw.get("cause", [])
+                specific_code = "variant_publish_failed"
+                for cause in cause_list:
+                    if isinstance(cause, dict) and cause.get("code"):
+                        specific_code = cause["code"]
+                        break
+                # Log variant error for remediation dashboard
+                try:
+                    from app.services.remediation_engine import log_publish_error
+                    await log_publish_error(
+                        db=db, user_id=current_user.id,
+                        listing_id=variant_listing.id,
+                        product_id=data.product_id,
+                        meli_category_id=base_listing.meli_category_id,
+                        error_code=specific_code,
+                        error_message=str(raw.get("message") or raw.get("detail") or "Unknown")[:500],
+                    )
+                except Exception as _log_err:
+                    logger.error(f"[REMEDIATION] Failed to log variant error: {_log_err}")
                 # Extract the most user-friendly message from ML error
                 ml_msg = raw.get("message") or raw.get("detail") or ""
                 causes = raw.get("cause", [])
@@ -1478,7 +1948,7 @@ async def publish_variants_to_meli(
 
             results.append(ListingVariantResult(
                 variation_asin=variation_asin,
-                variant_name=dim_label,
+                variant_name=dim_label or variation_asin,
                 success=True,
                 listing_id=variant_listing.id,
                 meli_item_id=variant_listing.meli_item_id,
@@ -1492,17 +1962,17 @@ async def publish_variants_to_meli(
                 await db.rollback()
             except Exception:
                 pass
-            # Ensure a fresh transaction exists for the next iteration;
-            # after rollback the session has no active transaction and
-            # begin_nested() would fail with a greenlet_spawn error.
+            # Reset the connection so subsequent variants get a clean session.
+            # db.begin() after rollback can fail with greenlet_spawn errors;
+            # closing + reconnecting is more reliable.
             try:
-                if not db.in_transaction():
-                    await db.begin()
+                await db.close()
+                await db.connection()
             except Exception:
-                pass
+                logger.warning("[publish-variants] Failed to reset DB session after error")
             results.append(ListingVariantResult(
                 variation_asin=variation_asin,
-                variant_name=dim_label,
+                variant_name=dim_label or variation_asin,
                 success=False,
                 error=user_error or _friendly_error(exc),
             ))
@@ -1515,3 +1985,120 @@ async def publish_variants_to_meli(
         succeeded=succeeded,
         failed=len(results) - succeeded,
     )
+
+
+@router.post("/sync-all-items")
+async def sync_all_seller_items(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Sync all existing ML items into the local database.
+    Fetches all seller items from ML and creates MeliListing records
+    for items not already tracked by the system.
+    Useful for detecting products published manually on ML.
+    """
+    from app.models.meli_token import MeliToken
+
+    token = (await db.execute(
+        select(MeliToken).where(MeliToken.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not token or not token.meli_user_id:
+        raise HTTPException(status_code=400, detail="No ML account connected")
+
+    # Fetch all seller item IDs (paginated)
+    all_item_ids: list[str] = []
+    offset = 0
+    limit = 50
+    while True:
+        result = await _meli_request(
+            db, current_user.id, "GET",
+            f"/users/{token.meli_user_id}/items/search",
+            params={"offset": str(offset), "limit": str(limit)},
+        )
+        if not result or result.get("error"):
+            break
+        ids = result.get("results", [])
+        if not ids:
+            break
+        all_item_ids.extend(ids)
+        total = result.get("paging", {}).get("total", 0)
+        offset += limit
+        if offset >= total:
+            break
+
+    if not all_item_ids:
+        return {"imported": 0, "skipped": 0, "total_ml_items": 0}
+
+    # Get existing meli_item_ids in our DB to skip them
+    existing_ids_result = await db.execute(
+        select(MeliListing.meli_item_id).where(
+            MeliListing.user_id == current_user.id,
+            MeliListing.meli_item_id.isnot(None),
+        )
+    )
+    existing_ids = {row[0] for row in existing_ids_result.all()}
+
+    new_item_ids = [id for id in all_item_ids if id not in existing_ids]
+
+    imported = 0
+    skipped = 0
+
+    # Process in batches of 20 (ML multi-get limit)
+    for i in range(0, len(new_item_ids), 20):
+        batch = new_item_ids[i:i + 20]
+        ids_str = ",".join(batch)
+        items_response = await _meli_request(
+            db, current_user.id, "GET", "/items",
+            params={"ids": ids_str},
+        )
+        if not items_response:
+            continue
+
+        response_list = items_response if isinstance(items_response, list) else []
+        for entry in response_list:
+            if not isinstance(entry, dict) or entry.get("code") != 200:
+                skipped += 1
+                continue
+            body = entry.get("body", {})
+            if body.get("status") == "closed":
+                skipped += 1
+                continue
+
+            # Create a local listing record for this ML item
+            listing = MeliListing(
+                user_id=current_user.id,
+                product_id=0,  # Unknown — not linked to a backend product
+                meli_item_id=body.get("id"),
+                title=(body.get("title", ""))[:60],
+                meli_price=body.get("price", 0),
+                meli_category_id=body.get("category_id"),
+                status=body.get("status", "active"),
+                meli_permalink=body.get("permalink"),
+                available_quantity=body.get("available_quantity", 0),
+                listing_type=body.get("listing_type_id", "gold_special"),
+                variation_asin=None,
+            )
+            # Extract seller_custom_field as variation_asin hint
+            sku = body.get("seller_custom_field")
+            if sku:
+                listing.variation_asin = sku[:20]
+
+            # Use savepoint per item to handle IntegrityError from the partial
+            # unique index (e.g., multiple items without SKU share product_id=0)
+            try:
+                async with db.begin_nested():
+                    db.add(listing)
+                imported += 1
+            except Exception:
+                skipped += 1
+
+    if imported > 0:
+        await db.commit()
+
+    return {
+        "imported": imported,
+        "skipped_existing": len(existing_ids),
+        "skipped_other": skipped,
+        "total_ml_items": len(all_item_ids),
+    }
