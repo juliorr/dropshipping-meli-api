@@ -21,6 +21,10 @@ from app.models.order import Order            # noqa: F401
 
 target_metadata = Base.metadata
 
+# Override alembic.ini URL with the app's DATABASE_URL (handles env vars)
+from app.config import settings
+config.set_main_option("sqlalchemy.url", settings.database_url)
+
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
