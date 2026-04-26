@@ -22,14 +22,6 @@ from app.services.meli_auth import get_valid_token
 # Allowed base directory for local file reads
 _ALLOWED_LOCAL_BASE = Path("/app/media")
 
-ML_DESCRIPTION_DISCLAIMER = (
-    "Producto 100% original y nuevo, importado desde USA. "
-    "No es pirateria ni réplica. Empaque y manuales pueden estar en inglés. "
-    "Precio final: sin cargos extra de importación. "
-    "Garantía del vendedor por defectos de fábrica. "
-    "Marcas mencionadas pertenecen a sus respectivos dueños; somos revendedor independiente."
-)
-
 # Docker internal service hostnames to block
 _BLOCKED_HOSTNAMES = frozenset({
     "redis", "meli-redis", "postgres", "meli-postgres",
@@ -736,12 +728,6 @@ async def publish_item(
             )
             description = ""
 
-    if ML_DESCRIPTION_DISCLAIMER not in (description or ""):
-        if description:
-            description = f"{ML_DESCRIPTION_DISCLAIMER}\n\n{description}"
-        else:
-            description = ML_DESCRIPTION_DISCLAIMER
-
     # ML API does NOT accept 'description' in the item creation payload.
     # It must be sent in a separate POST /items/{id}/description request after creation.
     #
@@ -921,7 +907,7 @@ async def publish_item(
         logger.info(f"Item published on ML: {item_id} for user {user_id}")
 
         # Publish description in a separate request (ML API requirement)
-        if item_id:
+        if description and item_id:
             desc_result = await _meli_request(
                 db, user_id, "POST", f"/items/{item_id}/description",
                 json_data={"plain_text": description},
