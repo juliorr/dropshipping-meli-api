@@ -16,6 +16,9 @@ from app.schemas.listing import (
     ListingListResponse,
     ListingResponse,
     ListingUpdate,
+    PriceUpdateAction,
+    PriceUpdateBatchResponse,
+    PriceUpdateDetail,
     StockPauseAction,
     StockPauseBatchResponse,
     StockPauseDetail,
@@ -464,3 +467,83 @@ async def batch_stock_pause(
     return StockPauseBatchResponse(
         paused=paused, reactivated=reactivated, errors=errors, details=details
     )
+
+
+@router.post("/price-update/batch", response_model=PriceUpdateBatchResponse)
+async def batch_price_update(
+    actions: List[PriceUpdateAction] = Body(...),
+    _: str = Depends(verify_api_key),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Internal endpoint (API key protected) — batch update ML listing prices.
+
+    Called by backend-api's check_prices Celery task when an Amazon price
+    change is detected and the user has auto_update_prices enabled.
+    """
+    from app.services.meli_client import update_price
+
+    updated = 0
+    errors = 0
+    details: List[PriceUpdateDetail] = []
+
+    for act in actions:
+        result = await db.execute(
+            select(MeliListing).where(
+                MeliListing.product_id == act.product_id,
+                MeliListing.user_id == act.user_id,
+                MeliListing.status == "active",
+                MeliListing.meli_item_id.isnot(None),
+            )
+        )
+        listings = result.scalars().all()
+
+        if not listings:
+            details.append(PriceUpdateDetail(
+                product_id=act.product_id,
+                new_price=act.new_price,
+                success=True,
+                error="no matching active listings",
+            ))
+            continue
+
+        for listing in listings:
+            try:
+                ml_result = await update_price(
+                    db, act.user_id, listing.meli_item_id, act.new_price
+                )
+                if ml_result and not ml_result.get("error"):
+                    listing.meli_price = act.new_price
+                    updated += 1
+                    details.append(PriceUpdateDetail(
+                        product_id=act.product_id,
+                        meli_item_id=listing.meli_item_id,
+                        new_price=act.new_price,
+                        success=True,
+                    ))
+                else:
+                    errors += 1
+                    error_msg = ml_result.get("message", "ML API error") if ml_result else "No response"
+                    details.append(PriceUpdateDetail(
+                        product_id=act.product_id,
+                        meli_item_id=listing.meli_item_id,
+                        new_price=act.new_price,
+                        success=False,
+                        error=error_msg,
+                    ))
+            except Exception as e:
+                errors += 1
+                logger.error(
+                    f"[price-update] Failed for listing {listing.meli_item_id} "
+                    f"product {act.product_id}: {e}"
+                )
+                details.append(PriceUpdateDetail(
+                    product_id=act.product_id,
+                    meli_item_id=listing.meli_item_id,
+                    new_price=act.new_price,
+                    success=False,
+                    error=str(e),
+                ))
+
+    await db.commit()
+    return PriceUpdateBatchResponse(updated=updated, errors=errors, details=details)

@@ -94,3 +94,24 @@ class StockPauseBatchResponse(BaseModel):
     reactivated: int = 0
     errors: int = 0
     details: List[StockPauseDetail] = []
+
+
+class PriceUpdateAction(BaseModel):
+    """Single action in a batch price-update request."""
+    product_id: int
+    user_id: int
+    new_price: float = Field(..., gt=0)
+
+
+class PriceUpdateDetail(BaseModel):
+    product_id: int
+    meli_item_id: Optional[str] = None
+    new_price: float
+    success: bool
+    error: Optional[str] = None
+
+
+class PriceUpdateBatchResponse(BaseModel):
+    updated: int = 0
+    errors: int = 0
+    details: List[PriceUpdateDetail] = []
