@@ -812,6 +812,9 @@ async def publish_item(
                 "available_quantity": var_qty,
                 "attribute_combinations": attr_combinations,
             }
+            var_asin = var.get("asin")
+            if var_asin:
+                var_entry["seller_custom_field"] = str(var_asin)
             if var_picture_ids:
                 var_entry["picture_ids"] = var_picture_ids
             ml_variations.append(var_entry)
