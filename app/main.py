@@ -29,6 +29,7 @@ from app.routers.listings import router as listings_router
 from app.routers.orders import router as orders_router
 from app.routers.images import router as images_router, media_router
 from app.routers.remediation import router as remediation_router
+from app.routers.scheduler_admin import router as scheduler_admin_router
 from app.scheduler import scheduler, setup_scheduler
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ app.include_router(orders_router)
 app.include_router(images_router)
 app.include_router(media_router)
 app.include_router(remediation_router)
+app.include_router(scheduler_admin_router)
 
 
 @app.get("/", tags=["Health"])
