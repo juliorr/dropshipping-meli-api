@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import AsyncClient, ASGITransport
-from jose import jwt
+import jwt
 
 from app.config import settings
 from app.dependencies import get_db

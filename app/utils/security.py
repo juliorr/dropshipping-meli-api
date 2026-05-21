@@ -2,7 +2,8 @@
 
 from typing import Any, Optional
 
-from jose import JWTError, jwt
+import jwt
+from jwt.exceptions import PyJWTError
 
 from app.config import settings
 
@@ -14,5 +15,5 @@ def decode_token(token: str) -> Optional[dict[str, Any]]:
             token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
         )
         return payload
-    except JWTError:
+    except PyJWTError:
         return None
