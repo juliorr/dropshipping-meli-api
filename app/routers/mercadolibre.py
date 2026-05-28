@@ -20,6 +20,7 @@ from app.schemas.meli import (
     MeliPublishResponse,
     MeliPublishVariantsRequest,
     MeliTokenStatus,
+    MeliUpdateRequest,
 )
 from app.schemas.listing import ListingVariantResult, MeliPublishBulkResponse
 from app.services.meli_auth import exchange_code_for_tokens, get_auth_url
@@ -1128,6 +1129,8 @@ async def publish_listing_to_meli(
     listing.meli_item_id = result.get("id")
     listing.meli_permalink = result.get("permalink")
     listing.status = "active"
+    if data.manufacturing_time:
+        listing.manufacturing_time = data.manufacturing_time
 
     # Save ML picture IDs so we can reuse them without local filesystem
     ml_pictures = result.get("pictures", [])
@@ -1169,12 +1172,14 @@ async def publish_listing_to_meli(
 @router.put("/update/{listing_id}")
 async def update_listing_on_meli(
     listing_id: int,
+    body: Optional[MeliUpdateRequest] = None,
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Update an existing listing on Mercado Libre.
     Syncs price and images from the local listing/product to ML.
+    Optionally updates MANUFACTURING_TIME (sale_terms) when supplied in body.
     """
     # Get the listing
     query = select(MeliListing).where(
@@ -1192,6 +1197,13 @@ async def update_listing_on_meli(
         "price": float(listing.meli_price),
         "available_quantity": listing.available_quantity,
     }
+
+    # Optional MANUFACTURING_TIME update (capped at 45 by the schema)
+    new_manufacturing_time = body.manufacturing_time if body else None
+    if new_manufacturing_time:
+        updates["sale_terms"] = [
+            {"id": "MANUFACTURING_TIME", "value_name": f"{new_manufacturing_time} días"}
+        ]
 
     # Reuse saved ML picture IDs if available, otherwise re-upload from filesystem
     if listing.meli_picture_ids:
@@ -1218,6 +1230,10 @@ async def update_listing_on_meli(
     if result is None or result.get("error"):
         detail = result.get("detail", "Unknown error") if result else "No response from ML"
         raise HTTPException(status_code=500, detail=f"ML update failed: {detail}")
+
+    if new_manufacturing_time:
+        listing.manufacturing_time = new_manufacturing_time
+        await db.commit()
 
     return {
         "message": "Listing updated on Mercado Libre",
@@ -1956,6 +1972,8 @@ async def publish_variants_to_meli(
                 variant_listing.meli_item_id = result.get("id")
                 variant_listing.meli_permalink = result.get("permalink")
                 variant_listing.status = "active"
+                if data.manufacturing_time:
+                    variant_listing.manufacturing_time = data.manufacturing_time
             await db.commit()
 
             results.append(ListingVariantResult(

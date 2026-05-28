@@ -16,6 +16,9 @@ from app.schemas.listing import (
     ListingListResponse,
     ListingResponse,
     ListingUpdate,
+    ManufacturingTimeUpdateAction,
+    ManufacturingTimeUpdateBatchResponse,
+    ManufacturingTimeUpdateDetail,
     PriceUpdateAction,
     PriceUpdateBatchResponse,
     PriceUpdateDetail,
@@ -371,6 +374,7 @@ async def get_listings_by_product_ids(
             "meli_item_id": listing.meli_item_id,
             "variation_asin": listing.variation_asin,
             "paused_by_stock": listing.paused_by_stock,
+            "manufacturing_time": listing.manufacturing_time,
         })
     return out
 
@@ -547,3 +551,103 @@ async def batch_price_update(
 
     await db.commit()
     return PriceUpdateBatchResponse(updated=updated, errors=errors, details=details)
+
+
+@router.post("/manufacturing-time-update/batch", response_model=ManufacturingTimeUpdateBatchResponse)
+async def batch_manufacturing_time_update(
+    actions: List[ManufacturingTimeUpdateAction] = Body(...),
+    _: str = Depends(verify_api_key),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Internal endpoint (API key protected) — batch update ML MANUFACTURING_TIME
+    (sale_terms) when Amazon's delivery estimate grows.
+
+    Called by backend-api's check_prices Celery task. Skips listings whose
+    locally tracked manufacturing_time already covers the requested value.
+    """
+    from app.services.meli_client import update_item
+
+    updated = 0
+    skipped = 0
+    errors = 0
+    details: List[ManufacturingTimeUpdateDetail] = []
+
+    for act in actions:
+        result = await db.execute(
+            select(MeliListing).where(
+                MeliListing.product_id == act.product_id,
+                MeliListing.user_id == act.user_id,
+                MeliListing.status.in_(("active", "paused")),
+                MeliListing.meli_item_id.isnot(None),
+            )
+        )
+        listings = result.scalars().all()
+
+        if not listings:
+            details.append(ManufacturingTimeUpdateDetail(
+                product_id=act.product_id,
+                manufacturing_time=act.manufacturing_time,
+                success=True,
+                error="no matching listings",
+            ))
+            continue
+
+        for listing in listings:
+            if listing.manufacturing_time is not None and listing.manufacturing_time >= act.manufacturing_time:
+                skipped += 1
+                details.append(ManufacturingTimeUpdateDetail(
+                    product_id=act.product_id,
+                    meli_item_id=listing.meli_item_id,
+                    manufacturing_time=act.manufacturing_time,
+                    success=True,
+                    error="already covers requested value",
+                ))
+                continue
+
+            try:
+                ml_result = await update_item(
+                    db, act.user_id, listing.meli_item_id,
+                    {
+                        "sale_terms": [
+                            {"id": "MANUFACTURING_TIME", "value_name": f"{act.manufacturing_time} días"}
+                        ]
+                    },
+                )
+                if ml_result and not ml_result.get("error"):
+                    listing.manufacturing_time = act.manufacturing_time
+                    updated += 1
+                    details.append(ManufacturingTimeUpdateDetail(
+                        product_id=act.product_id,
+                        meli_item_id=listing.meli_item_id,
+                        manufacturing_time=act.manufacturing_time,
+                        success=True,
+                    ))
+                else:
+                    errors += 1
+                    error_msg = ml_result.get("message", "ML API error") if ml_result else "No response"
+                    details.append(ManufacturingTimeUpdateDetail(
+                        product_id=act.product_id,
+                        meli_item_id=listing.meli_item_id,
+                        manufacturing_time=act.manufacturing_time,
+                        success=False,
+                        error=error_msg,
+                    ))
+            except Exception as e:
+                errors += 1
+                logger.error(
+                    f"[manufacturing-time-update] Failed for listing {listing.meli_item_id} "
+                    f"product {act.product_id}: {e}"
+                )
+                details.append(ManufacturingTimeUpdateDetail(
+                    product_id=act.product_id,
+                    meli_item_id=listing.meli_item_id,
+                    manufacturing_time=act.manufacturing_time,
+                    success=False,
+                    error=str(e),
+                ))
+
+    await db.commit()
+    return ManufacturingTimeUpdateBatchResponse(
+        updated=updated, skipped=skipped, errors=errors, details=details
+    )

@@ -101,6 +101,11 @@ class MeliPublishRequest(BaseModel):
     variations: Optional[List[VariationPublishItem]] = None  # Per-variant prices/quantities/images
 
 
+class MeliUpdateRequest(BaseModel):
+    """Optional body for PUT /meli/update/{listing_id}."""
+    manufacturing_time: Optional[int] = Field(None, ge=1, le=45)
+
+
 class MeliPublishResponse(BaseModel):
     """Response after publishing to ML."""
     meli_item_id: str

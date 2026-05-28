@@ -115,3 +115,25 @@ class PriceUpdateBatchResponse(BaseModel):
     updated: int = 0
     errors: int = 0
     details: List[PriceUpdateDetail] = []
+
+
+class ManufacturingTimeUpdateAction(BaseModel):
+    """Single action in a batch manufacturing-time-update request."""
+    product_id: int
+    user_id: int
+    manufacturing_time: int = Field(..., ge=1, le=45)
+
+
+class ManufacturingTimeUpdateDetail(BaseModel):
+    product_id: int
+    meli_item_id: Optional[str] = None
+    manufacturing_time: int
+    success: bool
+    error: Optional[str] = None
+
+
+class ManufacturingTimeUpdateBatchResponse(BaseModel):
+    updated: int = 0
+    skipped: int = 0
+    errors: int = 0
+    details: List[ManufacturingTimeUpdateDetail] = []
