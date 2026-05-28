@@ -39,6 +39,10 @@ class MeliListing(Base):
     listing_type: Mapped[str] = mapped_column(String(20), default="gold_special", nullable=False)
     paused_by_stock: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     meli_picture_ids: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    # Last MANUFACTURING_TIME (in days) sent to ML for this listing.
+    # Used to skip redundant updates and to compute sync deltas when Amazon's
+    # promised delivery time changes.
+    manufacturing_time: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
