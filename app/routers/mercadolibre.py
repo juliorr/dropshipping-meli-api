@@ -1554,21 +1554,32 @@ def _friendly_error(exc: Exception) -> str:
     return msg[:200] if len(msg) <= 200 else msg[:200] + "…"
 
 
-def _get_dimension_display(attributes: dict, display_labels: dict) -> str:
-    """Return a short human-readable label for this variant (used in ML title suffix).
-    Returns the attribute VALUE (e.g. 'Cacao Nib Crunch'), not the label ('Flavor').
-    Returns empty string when no meaningful attribute is found.
+def _get_variant_labels(attributes: dict, display_labels: dict) -> tuple[str, str]:
+    """Return (type_label, color_label) for this variant.
+
+    type_label picks the first non-empty value among flavor/scent/size/style.
+    color_label is the value of color_name when present.
+    Either may be empty. When neither type-priority nor color exist, falls back
+    to the first available attribute value as type_label.
     """
-    priority = ["flavor_name", "scent_name", "color_name", "size_name", "style_name"]
-    for key in priority:
-        if key in attributes and attributes[key]:
-            return attributes[key]
-    # Use first available attribute value
-    if attributes:
+    type_priority = ["flavor_name", "scent_name", "size_name", "style_name"]
+    type_label = ""
+    for key in type_priority:
+        if attributes.get(key):
+            type_label = attributes[key]
+            break
+    color_label = attributes.get("color_name") or ""
+    if not type_label and not color_label and attributes:
         first_key = next(iter(attributes))
         if attributes[first_key]:
-            return attributes[first_key]
-    return ""
+            type_label = attributes[first_key]
+    return type_label, color_label
+
+
+def _get_dimension_display(attributes: dict, display_labels: dict) -> str:
+    """Backwards-compatible single-string variant label (joins type + color)."""
+    type_label, color_label = _get_variant_labels(attributes, display_labels)
+    return " - ".join(p for p in (type_label, color_label) if p)
 
 
 @router.post("/publish-variants", response_model=MeliPublishBulkResponse)
@@ -1757,19 +1768,20 @@ async def publish_variants_to_meli(
         user_error: str | None = None
         dim_label: str = ""
         try:
-            # Build variant title: "Dim Label - Base Title" truncated to 60 chars (ML limit).
-            # Variant name goes FIRST so it's always visible even when base is long.
-            # When no dimension attribute exists, just use the base title (no prefix).
-            dim_label = _get_dimension_display(variation.attributes, variation.display_labels)
+            # Build variant title: "{type} - {color} - {base_title}" capped at ML's 60-char limit.
+            # Variant attributes go FIRST and are preserved in full; base_title is truncated to fit.
+            type_label, color_label = _get_variant_labels(variation.attributes, variation.display_labels)
+            parts = [p for p in (type_label, color_label) if p]
+            dim_label = " - ".join(parts)
             ML_TITLE_LIMIT = 60
-            if dim_label:
-                separator = " - "
-                # If dim_label alone exceeds the limit, truncate it
-                dim_label_safe = dim_label[:ML_TITLE_LIMIT - len(separator) - 5].rstrip() if len(dim_label) > ML_TITLE_LIMIT - len(separator) - 5 else dim_label
-                prefix = f"{dim_label_safe}{separator}"
-                remaining = ML_TITLE_LIMIT - len(prefix)
-                truncated_base = base_title[:remaining].rstrip() if remaining > 0 else ""
-                variant_title = f"{prefix}{truncated_base}"
+            SEP = " - "
+            if parts:
+                prefix = SEP.join(parts) + SEP
+                if len(prefix) >= ML_TITLE_LIMIT:
+                    variant_title = prefix[:ML_TITLE_LIMIT].rstrip(" -")
+                else:
+                    remaining = ML_TITLE_LIMIT - len(prefix)
+                    variant_title = (prefix + base_title[:remaining].rstrip()).rstrip()
             else:
                 variant_title = base_title[:ML_TITLE_LIMIT].rstrip()
 

@@ -70,6 +70,12 @@ def test_generate_code_challenge_different_verifiers_differ():
 # get_auth_url
 # ---------------------------------------------------------------------------
 
+def _extract_state(url: str) -> str:
+    match = re.search(r"[?&]state=([A-Za-z0-9_\-]+)", url)
+    assert match, f"state param not found in url: {url}"
+    return match.group(1)
+
+
 @pytest.mark.asyncio
 async def test_get_auth_url_contains_required_params():
     url = await get_auth_url(user_id=1)
@@ -79,23 +85,24 @@ async def test_get_auth_url_contains_required_params():
     assert "redirect_uri=" in url
     assert "code_challenge=" in url
     assert "code_challenge_method=S256" in url
-    assert "state=1" in url
+    # state is now a CSRF nonce (not the user_id) — must be a non-empty URL-safe token
+    state = _extract_state(url)
+    assert len(state) >= 32
 
 
 @pytest.mark.asyncio
-async def test_get_auth_url_different_state_per_user():
+async def test_get_auth_url_uses_unique_state_per_call():
     url1 = await get_auth_url(user_id=1)
     url2 = await get_auth_url(user_id=2)
-    assert "state=1" in url1
-    assert "state=2" in url2
+    assert _extract_state(url1) != _extract_state(url2)
 
 
 @pytest.mark.asyncio
 async def test_get_auth_url_stores_verifier_in_cache():
     from app.cache import cache
-    user_id = 9999
-    await get_auth_url(user_id=user_id)
-    cached = await cache.get(f"meli_pkce:{user_id}")
+    url = await get_auth_url(user_id=9999)
+    state = _extract_state(url)
+    cached = await cache.get(f"meli_pkce:{state}")
     assert cached is not None
     assert len(cached) >= 43
 
